@@ -7,7 +7,10 @@ package inference
 */
 import "C"
 
-import "unsafe"
+import (
+	"fmt"
+	"unsafe"
+)
 
 func FileReader(filename string) *C.FILE {
 	cFilename := C.CString(filename)
@@ -17,4 +20,9 @@ func FileReader(filename string) *C.FILE {
 
 func CloseFileReader(f *C.FILE) {
 	C.closefile(f)
+}
+
+func GGUFCheck(f *C.FILE) {
+	b := C.magic_word(f)
+	fmt.Println(b)
 }

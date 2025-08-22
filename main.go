@@ -17,7 +17,8 @@ func main() {
 		fmt.Println("File opened successfully")
 	}
 
+	inference.GGUFCheck(file)
+
 	inference.CloseFileReader(file)
 	fmt.Println("Close file successfully")
-
 }
