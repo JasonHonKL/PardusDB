@@ -15,4 +15,11 @@ pardus llama2 data.csv format.format
 - [] we have to convert llamacpp inference part
 - [] Inference qwen0.5b model
 - [] fine tune qwen0.5b model# Pardus-
-# Pardus-
+
+
+## Roadmap
+- [] we use tiny llama as an experiment finish whole workflow once
+- [] next we refactor the code 
+- [] then we furhter handle the other model architecture
+
+## Reference
