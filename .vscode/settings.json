@@ -1,0 +1,10 @@
+{
+    "files.associations": {
+        "*.embeddedhtml": "html",
+        "win.h": "c",
+        "mman.h": "c",
+        "stdio.h": "c",
+        "__config": "c",
+        "algorithm": "c"
+    }
+}

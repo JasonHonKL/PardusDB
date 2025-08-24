@@ -1,25 +1,8 @@
 # Pardus RL
 
-Doing model fine tune just like ollama. 
-Final goal is 
-```
-pardus llama2 data.csv format.format
-```
+We want our agent to be able to generate / train / distill a model with a single prompt + data set.
 
-## Design
-- Use C / C++ for model details
-- Use Go lang as much as possible for memory safety 
-- Support GGUF first ?
+For simplicity we would first use python to make a barebone and later finish the base architecture we would switch to using go lang (which is my favourite langauge loll)
 
-## Todo
-- [] we have to convert llamacpp inference part
-- [] Inference qwen0.5b model
-- [] fine tune qwen0.5b model# Pardus-
-
-
-## Roadmap
-- [] we use tiny llama as an experiment finish whole workflow once
-- [] next we refactor the code 
-- [] then we furhter handle the other model architecture
-
-## Reference
+## Contributing
+We welcome all kinds of contribution.
