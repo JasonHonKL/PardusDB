@@ -12,6 +12,7 @@ import (
 
 // the key db file is placed here
 const MODEL = "nomic-embed-text:latest"
+const THRESHOLD = 0.9
 
 type PardusDB struct {
 	Name   string
@@ -137,6 +138,10 @@ func Query(
 	})
 
 	// if value --> insert
+	if simScore[0].sim > float32(THRESHOLD) {
+		return layer.Data[simScore[0].index].Value, nil
+	}
+	// return value not found
 	return layer.Data[simScore[0].index].Value, nil
 }
 
