@@ -24,6 +24,12 @@ type CreateTableParam struct {
 	DB       string // db name
 }
 
+type InsertParam struct {
+	DBName    string
+	TableName string
+	Query     string
+}
+
 func main() {
 
 	cache := net.Cache{
@@ -34,7 +40,9 @@ func main() {
 
 	router.POST("/query", func(ctx *gin.Context) {})
 
-	router.POST("/insert", func(ctx *gin.Context) {})
+	router.POST("/insert", func(ctx *gin.Context) {
+
+	})
 
 	router.POST("/createdb", func(ctx *gin.Context) {
 		var param CreateDBParam
