@@ -14,6 +14,7 @@ import (
 const MODEL = "nomic-embed-text:latest"
 
 type PardusDB struct {
+	Name   string
 	Tables map[string]*Table
 }
 
@@ -45,6 +46,13 @@ type Object struct {
 type Val struct {
 	Text     string // this is the comparsion part
 	MetaData map[string]any
+}
+
+func CreateDB(name string) PardusDB {
+	return PardusDB{
+		Name:   name,
+		Tables: map[string]*Table{},
+	}
 }
 
 func CreateTable(
