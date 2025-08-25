@@ -30,8 +30,15 @@ Here is the detailed system design.
 
 We use golang for this application
 
+### Install 
+Just install go and then run 
+```
+go run main.go
+```
+
+
 ### Roadmap
 
-- [] Write an HTTP server (for simplicity)
+- [x] Write an HTTP server (for simplicity)
 - [x] Support vector search
 - [] Do the caching part 
