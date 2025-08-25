@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"pardusdb/embed"
+	"sort"
 	"time"
 )
 
@@ -75,23 +77,59 @@ func CreateTable(
 	return t, nil
 }
 
+type sim struct {
+	sim   float32
+	index uint32
+}
+
 // some mutex shd be done here but let's finish the prototype first
-func Query(prompt string, table string) {
+func Query(
+	prompt string, table *Table,
+) (Val, error) {
 	// the function should be embeded the prompt and hen calculate
+	if table.Count == 0 {
+		// query database
+		return Val{}, nil
+	}
 
 	vector, err := embed.OllamaEmbedding(prompt, MODEL)
 
 	if err != nil {
 		slog.Error("embedding error", "error", err)
-		return
+		return Val{}, err
 	}
 
-	fmt.Println(vector)
+	simScore := []sim{}
 
-	// the difference between the prompt vector and the centroid
-	// then follow up with full search from that table
+	for i := range min(table.Capacity, table.Count) {
+		s, err := similarity(table.Layers[i].Centriod, vector)
+		if err != nil {
+			return Val{}, err
+		}
+		simScore = append(simScore, sim{
+			sim:   s,
+			index: i,
+		})
+	}
+
+	sort.Slice(simScore, func(i, j int) bool {
+		return simScore[i].sim > simScore[j].sim
+	})
+
+	layer := table.Layers[simScore[0].index]
+
+	simScore = []sim{}
+	for i, ele := range layer.Data {
+		s, _ := similarity(ele.Vector, vector)
+		simScore = append(simScore, sim{sim: s, index: uint32(i)})
+	}
+
+	sort.Slice(simScore, func(i, j int) bool {
+		return simScore[i].sim > simScore[j].sim
+	})
 
 	// if value --> insert
+	return layer.Data[simScore[0].index].Value, nil
 }
 
 func InsertRow(
@@ -124,16 +162,16 @@ func InsertRow(
 		layer.Centriod = vector
 	} else {
 		layer.Centriod =
-			new_centroid(layer.Centriod, vector, float32(len(layer.Data)))
+			newCentroid(layer.Centriod, vector, float32(len(vector)))
 	}
 
 	table.pointer = (table.pointer + 1) % table.Capacity
-	fmt.Println(table.pointer)
+	table.Count += 1
 
 	return nil
 }
 
-func new_centroid(
+func newCentroid(
 	centroid, point []float32, size float32,
 ) []float32 {
 	n_c := []float32{}
@@ -144,4 +182,32 @@ func new_centroid(
 	return n_c
 }
 
-func dot_product(a, b []float32)
+func similarity(a, b []float32) (float32, error) {
+	size_a := len(a)
+	size_b := len(b)
+
+	if size_a != size_b {
+		return 0.0, errors.New("different vector size")
+	}
+
+	dot_product := float32(0.0)
+	norm_a := float32(0.0)
+	norm_b := float32(0.0)
+
+	for i := range size_a {
+		dot_product += a[i] * b[i]
+		norm_a += a[i] * a[i]
+		norm_b += b[i] * b[i]
+	}
+
+	if norm_a == float32(0.0) {
+		norm_a = float32(.00001)
+	}
+
+	if norm_b == float32(0.0) {
+		norm_b = float32(.00001)
+	}
+
+	return dot_product /
+		float32(math.Sqrt(float64(norm_a))) * float32(math.Sqrt(float64(norm_b))), nil
+}
