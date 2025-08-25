@@ -32,6 +32,6 @@ We use golang for this application
 
 ### Roadmap
 
-- Write an HTTP server (for simplicity)
-- Support vector search
-- Do the caching part 
+-[] Write an HTTP server (for simplicity)
+-[x] Support vector search
+-[] Do the caching part 
