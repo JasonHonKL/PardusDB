@@ -42,3 +42,4 @@ go run main.go
 - [x] Write an HTTP server (for simplicity)
 - [x] Support vector search
 - [] Do the caching part 
+- [] Algorithm improvement
