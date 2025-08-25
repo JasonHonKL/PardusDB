@@ -28,4 +28,10 @@ Here is the detailed system design.
 - Concurrent reads  
 - Timeout  
 
-Since this is a modern database, we decided to implement it in Rust.
+We use golang for this application
+
+### Roadmap
+
+- Write an HTTP server (for simplicity)
+- Support vector search
+- Do the caching part 
