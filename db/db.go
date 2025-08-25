@@ -37,6 +37,7 @@ type Layer struct {
 }
 
 type Object struct {
+	Key   string
 	Value Val
 
 	Time time.Time
@@ -146,10 +147,10 @@ func Query(
 }
 
 func InsertRow(
-	name string, val Val, db *PardusDB,
+	name string, key string, val Val, db *PardusDB,
 ) error {
 	// the insert shall be insert in to the nearest centroid one
-	vector, err := embed.OllamaEmbedding(val.Text, MODEL)
+	vector, err := embed.OllamaEmbedding(key, MODEL)
 
 	if err != nil {
 		slog.Error(err.Error())
@@ -164,6 +165,7 @@ func InsertRow(
 	layer := &table.Layers[table.pointer]
 
 	obj := Object{
+		Key:    key,
 		Value:  val,
 		Time:   time.Now(),
 		Vector: vector,
