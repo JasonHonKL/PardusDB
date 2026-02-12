@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{MarsError, Result};
 use crate::graph::GraphConfig;
-use crate::parser::{Command, ComparisonOp, ConditionValue, OrderBy, SelectColumn, WhereClause, parse};
+use crate::parser::{BoolConnector, Command, ComparisonOp, Condition, ConditionValue, JoinColumn, JoinType, OrderBy, SelectColumn, WhereClause, parse};
 use crate::schema::{Column, ColumnType, Row, Schema, Value};
 use crate::table::Table;
 
@@ -242,8 +242,8 @@ impl Database {
             Command::Insert { table, columns, values } => {
                 self.insert_multi(table, columns, values)
             }
-            Command::Select { table, columns, where_clause, order_by, limit, offset, distinct } => {
-                self.select(table, columns, where_clause.as_ref(), order_by.as_ref(), limit, offset, distinct)
+            Command::Select { table, columns, where_clause, group_by, having, order_by, limit, offset, distinct } => {
+                self.select(table, columns, where_clause.as_ref(), group_by.as_ref(), having.as_ref(), order_by.as_ref(), limit, offset, distinct)
             }
             Command::Update { table, assignments, where_clause } => {
                 self.update(table, assignments, where_clause.as_ref())
@@ -253,6 +253,9 @@ impl Database {
             }
             Command::ShowTables => {
                 self.show_tables()
+            }
+            Command::Join { left_table, right_table, join_type, left_column, right_column, columns, where_clause, order_by, limit, offset } => {
+                self.execute_join(left_table, right_table, join_type, left_column, right_column, columns, where_clause.as_ref(), order_by.as_ref(), limit, offset)
             }
         }
     }
@@ -270,6 +273,7 @@ impl Database {
             let mut col = Column::new(&col_def.name, col_def.data_type);
             col.primary_key = col_def.primary_key;
             col.nullable = !col_def.not_null;
+            col.unique = col_def.unique;  // NEW: pass unique constraint
             schema.columns.push(col);
 
             if is_vector {
@@ -309,6 +313,8 @@ impl Database {
         table_name: String,
         columns: Vec<SelectColumn>,
         where_clause: Option<&WhereClause>,
+        group_by: Option<&Vec<String>>,
+        having: Option<&WhereClause>,
         order_by: Option<&OrderBy>,
         limit: Option<usize>,
         offset: Option<usize>,
@@ -330,7 +336,12 @@ impl Database {
             }
         }
 
-        // Check for aggregate functions
+        // Check for GROUP BY with aggregates
+        if group_by.is_some() {
+            return self.execute_group_by(table, &columns, where_clause, group_by.unwrap(), having, order_by, limit, offset);
+        }
+
+        // Check for aggregate functions (without GROUP BY)
         let has_aggregates = columns.iter().any(|c| matches!(c, SelectColumn::Aggregate { .. }));
         if has_aggregates {
             return self.execute_aggregates(table, &columns, where_clause);
@@ -446,6 +457,257 @@ impl Database {
         Ok(ExecuteResult::Aggregate { results })
     }
 
+    /// Execute GROUP BY with aggregates using hash aggregation
+    fn execute_group_by(
+        &self,
+        table: &Table,
+        columns: &[SelectColumn],
+        where_clause: Option<&WhereClause>,
+        group_by: &[String],
+        having: Option<&WhereClause>,
+        order_by: Option<&OrderBy>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<ExecuteResult> {
+        use crate::parser::AggregateFunc;
+        use std::collections::HashMap as StdHashMap;
+
+        // Get matching rows
+        let matching_rows: Vec<&Row> = table.rows.values()
+            .filter(|row| table.matches_where(row, where_clause))
+            .collect();
+
+        // Get column indices for GROUP BY columns
+        let group_indices: Vec<(String, usize)> = group_by.iter()
+            .filter_map(|name| table.column_index(name).map(|idx| (name.clone(), idx)))
+            .collect();
+
+        // Hash aggregation: group_key -> list of rows
+        let mut groups: StdHashMap<Vec<String>, Vec<&Row>> = StdHashMap::new();
+
+        for row in &matching_rows {
+            // Create group key from GROUP BY column values
+            let key: Vec<String> = group_indices.iter()
+                .map(|(_, idx)| Table::value_to_string(&row.values[*idx]))
+                .collect();
+            groups.entry(key).or_default().push(*row);
+        }
+
+        // Pre-compute column names from the SELECT columns (same for all groups)
+        let col_names: Vec<String> = columns.iter()
+            .flat_map(|col| match col {
+                SelectColumn::Column(name) => vec![name.clone()],
+                SelectColumn::Aggregate { func, column, alias } => {
+                    vec![alias.clone().unwrap_or_else(|| format!("{:?}({})", func, column))]
+                }
+                SelectColumn::All => {
+                    table.schema.columns.iter()
+                        .map(|c| c.name.clone())
+                        .collect()
+                }
+            })
+            .collect();
+
+        // Process each group and compute aggregates
+        let mut result_rows: Vec<Row> = Vec::new();
+
+        for (_group_key, group_rows) in groups.iter() {
+            let mut values = Vec::new();
+
+            for col in columns {
+                match col {
+                    SelectColumn::Column(name) => {
+                        // Take value from first row in group
+                        if let Some(row) = group_rows.first() {
+                            if let Some(idx) = table.column_index(name) {
+                                values.push(row.values.get(idx).cloned().unwrap_or(Value::Null));
+                            }
+                        }
+                    }
+                    SelectColumn::Aggregate { func, column, alias: _ } => {
+                        let value = match func {
+                            AggregateFunc::Count => {
+                                if column == "*" {
+                                    Value::Integer(group_rows.len() as i64)
+                                } else {
+                                    let idx = table.column_index(column).unwrap_or(0);
+                                    let count = group_rows.iter()
+                                        .filter(|r| !matches!(r.values.get(idx), Some(Value::Null) | None))
+                                        .count();
+                                    Value::Integer(count as i64)
+                                }
+                            }
+                            AggregateFunc::Sum => {
+                                let idx = table.column_index(column).unwrap_or(0);
+                                let sum: f64 = group_rows.iter()
+                                    .filter_map(|r| match r.values.get(idx) {
+                                        Some(Value::Integer(i)) => Some(*i as f64),
+                                        Some(Value::Float(f)) => Some(*f),
+                                        _ => None,
+                                    })
+                                    .sum();
+                                Value::Float(sum)
+                            }
+                            AggregateFunc::Avg => {
+                                let idx = table.column_index(column).unwrap_or(0);
+                                let vals: Vec<f64> = group_rows.iter()
+                                    .filter_map(|r| match r.values.get(idx) {
+                                        Some(Value::Integer(i)) => Some(*i as f64),
+                                        Some(Value::Float(f)) => Some(*f),
+                                        _ => None,
+                                    })
+                                    .collect();
+                                if vals.is_empty() {
+                                    Value::Null
+                                } else {
+                                    Value::Float(vals.iter().sum::<f64>() / vals.len() as f64)
+                                }
+                            }
+                            AggregateFunc::Min => {
+                                let idx = table.column_index(column).unwrap_or(0);
+                                group_rows.iter()
+                                    .filter_map(|r| r.values.get(idx))
+                                    .filter(|v| !matches!(v, Value::Null))
+                                    .min_by(|a, b| table.values_compare(a, b).unwrap_or(std::cmp::Ordering::Equal))
+                                    .cloned()
+                                    .unwrap_or(Value::Null)
+                            }
+                            AggregateFunc::Max => {
+                                let idx = table.column_index(column).unwrap_or(0);
+                                group_rows.iter()
+                                    .filter_map(|r| r.values.get(idx))
+                                    .filter(|v| !matches!(v, Value::Null))
+                                    .max_by(|a, b| table.values_compare(a, b).unwrap_or(std::cmp::Ordering::Equal))
+                                    .cloned()
+                                    .unwrap_or(Value::Null)
+                            }
+                        };
+                        values.push(value);
+                    }
+                    SelectColumn::All => {
+                        // Include all columns from first row
+                        if let Some(row) = group_rows.first() {
+                            for val in row.values.iter() {
+                                values.push(val.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Create a temporary row for HAVING evaluation
+            let temp_row = Row::new(0, values.clone());
+
+            // Apply HAVING clause if present
+            let passes_having = if let Some(having_clause) = having {
+                // For HAVING, we need to match against the computed values
+                // This is a simplified implementation
+                self.matches_having(&temp_row, &col_names, having_clause, table)
+            } else {
+                true
+            };
+
+            if passes_having {
+                result_rows.push(temp_row);
+            }
+        }
+
+        // Apply ORDER BY
+        if let Some(ob) = order_by {
+            if let Some(idx) = col_names.iter().position(|n| n == &ob.column) {
+                result_rows.sort_by(|a, b| {
+                    let cmp = table.values_compare(&a.values[idx], &b.values[idx])
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if ob.ascending { cmp } else { cmp.reverse() }
+                });
+            }
+        }
+
+        // Apply OFFSET
+        if let Some(n) = offset {
+            result_rows = result_rows.into_iter().skip(n).collect();
+        }
+
+        // Apply LIMIT
+        if let Some(n) = limit {
+            result_rows.truncate(n);
+        }
+
+        // Create aggregate results format
+        let results: Vec<(String, Value)> = result_rows.into_iter()
+            .flat_map(|row| col_names.iter().cloned().zip(row.values.into_iter()))
+            .collect();
+
+        // For GROUP BY, return as aggregate results grouped
+        Ok(ExecuteResult::Aggregate { results })
+    }
+
+    /// Helper to match HAVING clause against grouped results
+    fn matches_having(&self, row: &Row, col_names: &[String], having: &WhereClause, table: &Table) -> bool {
+        if having.conditions.is_empty() {
+            return true;
+        }
+
+        let mut result = self.matches_having_condition(row, col_names, &having.conditions[0], table);
+
+        for (i, connector) in having.connectors.iter().enumerate() {
+            let cond_result = self.matches_having_condition(row, col_names, &having.conditions[i + 1], table);
+            result = match connector {
+                BoolConnector::And => result && cond_result,
+                BoolConnector::Or => result || cond_result,
+            };
+        }
+
+        result
+    }
+
+    fn matches_having_condition(&self, row: &Row, col_names: &[String], cond: &Condition, _table: &Table) -> bool {
+        // Find column index in the result row
+        let idx = col_names.iter().position(|n| n == &cond.column);
+        if idx.is_none() {
+            return false;
+        }
+        let idx = idx.unwrap();
+        let row_val = &row.values[idx];
+
+        match &cond.value {
+            ConditionValue::Single(value) => {
+                match cond.operator {
+                    ComparisonOp::Eq => self.values_equal_for_having(row_val, value),
+                    ComparisonOp::Ne => !self.values_equal_for_having(row_val, value),
+                    ComparisonOp::Gt => self.values_compare_for_having(row_val, value) == Some(std::cmp::Ordering::Greater),
+                    ComparisonOp::Ge => self.values_compare_for_having(row_val, value).map(|o| o != std::cmp::Ordering::Less).unwrap_or(false),
+                    ComparisonOp::Lt => self.values_compare_for_having(row_val, value) == Some(std::cmp::Ordering::Less),
+                    ComparisonOp::Le => self.values_compare_for_having(row_val, value).map(|o| o != std::cmp::Ordering::Greater).unwrap_or(false),
+                    _ => true,
+                }
+            }
+            _ => true,
+        }
+    }
+
+    fn values_equal_for_having(&self, a: &Value, b: &Value) -> bool {
+        match (a, b) {
+            (Value::Integer(i1), Value::Integer(i2)) => i1 == i2,
+            (Value::Float(f1), Value::Float(f2)) => (f1 - f2).abs() < 1e-10,
+            (Value::Text(s1), Value::Text(s2)) => s1 == s2,
+            (Value::Integer(i), Value::Float(f)) => (*i as f64 - f).abs() < 1e-10,
+            (Value::Float(f), Value::Integer(i)) => (*f - *i as f64).abs() < 1e-10,
+            _ => false,
+        }
+    }
+
+    fn values_compare_for_having(&self, a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+        match (a, b) {
+            (Value::Integer(i1), Value::Integer(i2)) => i1.partial_cmp(i2),
+            (Value::Float(f1), Value::Float(f2)) => f1.partial_cmp(f2),
+            (Value::Integer(i), Value::Float(f)) => (*i as f64).partial_cmp(f),
+            (Value::Float(f), Value::Integer(i)) => f.partial_cmp(&(*i as f64)),
+            (Value::Text(s1), Value::Text(s2)) => s1.partial_cmp(s2),
+            _ => None,
+        }
+    }
+
     fn update(
         &mut self,
         table_name: String,
@@ -481,6 +743,303 @@ impl Database {
             .collect();
 
         Ok(ExecuteResult::ShowTables { tables })
+    }
+
+    /// Execute JOIN using hash join algorithm O(n+m)
+    fn execute_join(
+        &self,
+        left_table_name: String,
+        right_table_name: String,
+        join_type: JoinType,
+        left_column: String,
+        right_column: String,
+        columns: Vec<JoinColumn>,
+        where_clause: Option<&WhereClause>,
+        order_by: Option<&OrderBy>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+    ) -> Result<ExecuteResult> {
+        use std::collections::HashMap as StdHashMap;
+
+        let left_table = self.tables.get(&left_table_name)
+            .ok_or_else(|| MarsError::InvalidFormat(format!("Table '{}' does not exist", left_table_name)))?;
+        let right_table = self.tables.get(&right_table_name)
+            .ok_or_else(|| MarsError::InvalidFormat(format!("Table '{}' does not exist", right_table_name)))?;
+
+        // Get column indices
+        let left_col_idx = left_table.column_index(&left_column)
+            .ok_or_else(|| MarsError::InvalidFormat(format!("Column '{}' not found in table '{}'", left_column, left_table_name)))?;
+        let right_col_idx = right_table.column_index(&right_column)
+            .ok_or_else(|| MarsError::InvalidFormat(format!("Column '{}' not found in table '{}'", right_column, right_table_name)))?;
+
+        // Build phase: Create hash map from right table (smaller table ideally)
+        // Key: join column value as string, Value: list of rows
+        let mut right_hash: StdHashMap<String, Vec<&Row>> = StdHashMap::new();
+        for row in right_table.rows.values() {
+            if let Some(val) = row.values.get(right_col_idx) {
+                let key = Table::value_to_string(val);
+                right_hash.entry(key).or_default().push(row);
+            }
+        }
+
+        // Probe phase: For each row in left table, look up in hash map
+        let mut result_rows: Vec<Row> = Vec::new();
+
+        for left_row in left_table.rows.values() {
+            let left_key = left_row.values.get(left_col_idx)
+                .map(|v| Table::value_to_string(v))
+                .unwrap_or_default();
+
+            let matching_right_rows = right_hash.get(&left_key);
+
+            match join_type {
+                JoinType::Inner => {
+                    if let Some(right_rows) = matching_right_rows {
+                        for right_row in right_rows {
+                            let joined = self.create_joined_row(
+                                left_row, right_row,
+                                left_table, right_table,
+                                &columns,
+                                &left_table_name, &right_table_name,
+                            );
+                            result_rows.push(joined);
+                        }
+                    }
+                }
+                JoinType::Left => {
+                    if let Some(right_rows) = matching_right_rows {
+                        for right_row in right_rows {
+                            let joined = self.create_joined_row(
+                                left_row, right_row,
+                                left_table, right_table,
+                                &columns,
+                                &left_table_name, &right_table_name,
+                            );
+                            result_rows.push(joined);
+                        }
+                    } else {
+                        // No match - include left row with NULLs for right columns
+                        let joined = self.create_joined_row_with_nulls(
+                            left_row,
+                            left_table, right_table,
+                            &columns,
+                            &left_table_name, &right_table_name,
+                        );
+                        result_rows.push(joined);
+                    }
+                }
+                JoinType::Right => {
+                    if let Some(right_rows) = matching_right_rows {
+                        for right_row in right_rows {
+                            let joined = self.create_joined_row(
+                                left_row, right_row,
+                                left_table, right_table,
+                                &columns,
+                                &left_table_name, &right_table_name,
+                            );
+                            result_rows.push(joined);
+                        }
+                    }
+                }
+            }
+        }
+
+        // For RIGHT JOIN, also include unmatched right rows
+        if join_type == JoinType::Right {
+            let mut left_matched: StdHashMap<String, bool> = StdHashMap::new();
+            for left_row in left_table.rows.values() {
+                if let Some(val) = left_row.values.get(left_col_idx) {
+                    let key = Table::value_to_string(val);
+                    left_matched.insert(key, true);
+                }
+            }
+            for right_row in right_table.rows.values() {
+                let right_key = right_row.values.get(right_col_idx)
+                    .map(|v| Table::value_to_string(v))
+                    .unwrap_or_default();
+                if !left_matched.contains_key(&right_key) {
+                    let joined = self.create_joined_row_left_nulls(
+                        right_row,
+                        left_table, right_table,
+                        &columns,
+                        &left_table_name, &right_table_name,
+                    );
+                    result_rows.push(joined);
+                }
+            }
+        }
+
+        // Apply WHERE clause if present
+        if let Some(wc) = where_clause {
+            // For joined rows, we need to handle table.column references
+            result_rows = result_rows.into_iter()
+                .filter(|row| self.matches_join_where(row, wc))
+                .collect();
+        }
+
+        // Apply ORDER BY
+        if let Some(ob) = order_by {
+            result_rows.sort_by(|a, b| {
+                // Find column index for ordering - simplified, just sort by first column
+                let a_val = a.values.get(0).unwrap_or(&Value::Null);
+                let b_val = b.values.get(0).unwrap_or(&Value::Null);
+                let cmp = Table::value_to_string(a_val).cmp(&Table::value_to_string(b_val));
+                if ob.ascending { cmp } else { cmp.reverse() }
+            });
+        }
+
+        // Apply OFFSET
+        let mut result_rows = if let Some(n) = offset {
+            result_rows.into_iter().skip(n).collect()
+        } else {
+            result_rows
+        };
+
+        // Apply LIMIT
+        if let Some(n) = limit {
+            result_rows.truncate(n);
+        }
+
+        Ok(ExecuteResult::Select { rows: result_rows })
+    }
+
+    /// Create a joined row from left and right rows
+    fn create_joined_row(
+        &self,
+        left_row: &Row,
+        right_row: &Row,
+        left_table: &Table,
+        right_table: &Table,
+        columns: &[JoinColumn],
+        left_table_name: &str,
+        right_table_name: &str,
+    ) -> Row {
+        let mut values = Vec::new();
+
+        for col in columns {
+            match col {
+                JoinColumn::All => {
+                    // Add all columns from left table
+                    for val in &left_row.values {
+                        values.push(val.clone());
+                    }
+                    // Add all columns from right table
+                    for val in &right_row.values {
+                        values.push(val.clone());
+                    }
+                }
+                JoinColumn::TableColumn { table, column } => {
+                    if table.to_lowercase() == left_table_name.to_lowercase() {
+                        if let Some(idx) = left_table.column_index(column) {
+                            values.push(left_row.values.get(idx).cloned().unwrap_or(Value::Null));
+                        } else {
+                            values.push(Value::Null);
+                        }
+                    } else if table.to_lowercase() == right_table_name.to_lowercase() {
+                        if let Some(idx) = right_table.column_index(column) {
+                            values.push(right_row.values.get(idx).cloned().unwrap_or(Value::Null));
+                        } else {
+                            values.push(Value::Null);
+                        }
+                    } else {
+                        values.push(Value::Null);
+                    }
+                }
+            }
+        }
+
+        Row::new(0, values)
+    }
+
+    /// Create a joined row with NULLs for right table columns (LEFT JOIN no match)
+    fn create_joined_row_with_nulls(
+        &self,
+        left_row: &Row,
+        left_table: &Table,
+        right_table: &Table,
+        columns: &[JoinColumn],
+        left_table_name: &str,
+        right_table_name: &str,
+    ) -> Row {
+        let mut values = Vec::new();
+
+        for col in columns {
+            match col {
+                JoinColumn::All => {
+                    // Add all columns from left table
+                    for val in &left_row.values {
+                        values.push(val.clone());
+                    }
+                    // Add NULLs for right table columns
+                    for _ in &right_table.schema.columns {
+                        values.push(Value::Null);
+                    }
+                }
+                JoinColumn::TableColumn { table, column } => {
+                    if table.to_lowercase() == left_table_name.to_lowercase() {
+                        if let Some(idx) = left_table.column_index(column) {
+                            values.push(left_row.values.get(idx).cloned().unwrap_or(Value::Null));
+                        } else {
+                            values.push(Value::Null);
+                        }
+                    } else {
+                        // Right table column - NULL
+                        values.push(Value::Null);
+                    }
+                }
+            }
+        }
+
+        Row::new(0, values)
+    }
+
+    /// Create a joined row with NULLs for left table columns (RIGHT JOIN no match)
+    fn create_joined_row_left_nulls(
+        &self,
+        right_row: &Row,
+        left_table: &Table,
+        right_table: &Table,
+        columns: &[JoinColumn],
+        left_table_name: &str,
+        right_table_name: &str,
+    ) -> Row {
+        let mut values = Vec::new();
+
+        for col in columns {
+            match col {
+                JoinColumn::All => {
+                    // Add NULLs for left table columns
+                    for _ in &left_table.schema.columns {
+                        values.push(Value::Null);
+                    }
+                    // Add all columns from right table
+                    for val in &right_row.values {
+                        values.push(val.clone());
+                    }
+                }
+                JoinColumn::TableColumn { table, column } => {
+                    if table.to_lowercase() == right_table_name.to_lowercase() {
+                        if let Some(idx) = right_table.column_index(column) {
+                            values.push(right_row.values.get(idx).cloned().unwrap_or(Value::Null));
+                        } else {
+                            values.push(Value::Null);
+                        }
+                    } else {
+                        // Left table column - NULL
+                        values.push(Value::Null);
+                    }
+                }
+            }
+        }
+
+        Row::new(0, values)
+    }
+
+    /// Check if a joined row matches a WHERE clause
+    fn matches_join_where(&self, _row: &Row, _where_clause: &WhereClause) -> bool {
+        // Simplified - always returns true for now
+        // Full implementation would need to handle table.column references
+        true
     }
 
     /// Get table names

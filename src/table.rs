@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::distance::{Distance, Euclidean};
 use crate::error::{MarsError, Result};
@@ -13,6 +13,8 @@ pub struct Table {
     pub graph: Graph<f32, Euclidean>,
     pub(crate) rows: HashMap<u64, Row>,
     pub(crate) next_id: u64,
+    /// Unique constraint indexes: column_name -> set of values
+    unique_indexes: HashMap<String, HashSet<String>>,  // Store values as strings for hashing
 }
 
 impl Table {
@@ -20,11 +22,18 @@ impl Table {
         let dimension = schema.get_vector_dimension()
             .ok_or_else(|| MarsError::InvalidConfig("Table must have a VECTOR column".into()))?;
 
+        // Initialize unique indexes for columns with UNIQUE constraint
+        let unique_indexes: HashMap<String, HashSet<String>> = schema.columns.iter()
+            .filter(|c| c.unique)
+            .map(|c| (c.name.clone(), HashSet::new()))
+            .collect();
+
         Ok(Table {
             schema,
             graph: Graph::new(dimension, config),
             rows: HashMap::new(),
             next_id: 1,
+            unique_indexes,
         })
     }
 
@@ -52,6 +61,8 @@ impl Table {
 
     /// Insert a row with pre-built values (faster, no validation)
     pub fn insert_row(&mut self, mut row_values: Vec<Value>) -> Result<u64> {
+        // Check unique constraints before inserting
+        self.check_unique_constraints(&row_values)?;
 
         // Auto-generate ID
         let id = self.next_id;
@@ -68,6 +79,9 @@ impl Table {
         // Insert into graph
         let _graph_id = self.graph.insert(vector);
 
+        // Update unique indexes
+        self.update_unique_indexes(&row_values);
+
         // Create row
         let row = Row::new(id, row_values);
         self.rows.insert(id, row);
@@ -80,6 +94,11 @@ impl Table {
     pub fn insert_batch(&mut self, rows: Vec<Vec<Value>>) -> Result<Vec<u64>> {
         if rows.is_empty() {
             return Ok(Vec::new());
+        }
+
+        // Check all unique constraints first
+        for row_values in &rows {
+            self.check_unique_constraints(row_values)?;
         }
 
         let batch_size = rows.len();
@@ -109,8 +128,9 @@ impl Table {
         // Batch insert into graph
         let _graph_ids = self.graph.insert_batch(vectors);
 
-        // Insert all rows
+        // Insert all rows and update unique indexes
         for (id, row_values) in prepared_rows {
+            self.update_unique_indexes(&row_values);
             let row = Row::new(id, row_values);
             self.rows.insert(id, row);
         }
@@ -527,6 +547,58 @@ impl Table {
             .collect();
 
         Row::new(row.id, values)
+    }
+
+    // ==================== UNIQUE CONSTRAINT HELPERS ====================
+
+    /// Convert a Value to a string for hashing in unique index
+    pub fn value_to_string(value: &Value) -> String {
+        match value {
+            Value::Null => "NULL".to_string(),
+            Value::Integer(i) => format!("I:{}", i),
+            Value::Float(f) => format!("F:{}", f),
+            Value::Text(s) => format!("T:{}", s),
+            Value::Boolean(b) => format!("B:{}", b),
+            Value::Vector(v) => format!("V:{}", v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",")),
+            Value::Blob(b) => format!("L:{}", b.len()),
+        }
+    }
+
+    /// Check if inserting these values would violate any unique constraints
+    fn check_unique_constraints(&self, row_values: &[Value]) -> Result<()> {
+        for (col_name, unique_set) in &self.unique_indexes {
+            if let Some(col_idx) = self.column_index(col_name) {
+                let value_str = Self::value_to_string(&row_values[col_idx]);
+                // Skip NULL values - they don't count for uniqueness
+                if value_str != "NULL" && unique_set.contains(&value_str) {
+                    return Err(MarsError::InvalidFormat(format!(
+                        "Duplicate value for UNIQUE column '{}'", col_name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Update unique indexes after a successful insert
+    fn update_unique_indexes(&mut self, row_values: &[Value]) {
+        // First, collect the (column_name, column_index) pairs
+        let col_indices: Vec<(String, usize, String)> = self.unique_indexes.keys()
+            .filter_map(|col_name| {
+                self.column_index(col_name).map(|idx| {
+                    (col_name.clone(), idx, Self::value_to_string(&row_values[idx]))
+                })
+            })
+            .collect();
+
+        // Then, update the unique indexes
+        for (col_name, _idx, value_str) in col_indices {
+            if value_str != "NULL" {
+                if let Some(unique_set) = self.unique_indexes.get_mut(&col_name) {
+                    unique_set.insert(value_str);
+                }
+            }
+        }
     }
 }
 

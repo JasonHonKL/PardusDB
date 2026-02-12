@@ -151,6 +151,8 @@ impl PreparedStatement {
                     table: table.clone(),
                     columns: columns.clone(),
                     where_clause,
+                    group_by: None, // Not supported in prepared statements yet
+                    having: None,   // Not supported in prepared statements yet
                     order_by: order_by.clone(),
                     limit: *limit,
                     offset: *offset,
@@ -290,7 +292,10 @@ impl PreparedStatement {
                     .collect();
                 CommandTemplate::Insert { table, columns, value_templates }
             }
-            Command::Select { table, columns, where_clause, order_by, limit, offset, distinct } => {
+            Command::Select { table, columns, where_clause, group_by, having, order_by, limit, offset, distinct } => {
+                // GROUP BY not yet supported in prepared statements
+                let _ = group_by;
+                let _ = having;
                 CommandTemplate::Select {
                     table,
                     columns,

@@ -37,6 +37,7 @@ pub struct Column {
     pub data_type: ColumnType,
     pub primary_key: bool,
     pub nullable: bool,
+    pub unique: bool,  // NEW: UNIQUE constraint
 }
 
 impl Column {
@@ -46,6 +47,7 @@ impl Column {
             data_type,
             primary_key: false,
             nullable: true,
+            unique: false,
         }
     }
 
@@ -57,6 +59,11 @@ impl Column {
 
     pub fn not_null(mut self) -> Self {
         self.nullable = false;
+        self
+    }
+
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
         self
     }
 }
@@ -108,7 +115,10 @@ impl Schema {
             if c.primary_key {
                 s.push_str(" PRIMARY KEY");
             }
-            if !c.nullable {
+            if c.unique {
+                s.push_str(" UNIQUE");
+            }
+            if !c.nullable && !c.primary_key {
                 s.push_str(" NOT NULL");
             }
             s

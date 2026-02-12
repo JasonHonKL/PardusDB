@@ -341,6 +341,10 @@ impl<'a> Connection<'a> {
                     // SELECT is immediate even in transaction
                     return self.execute_command(command);
                 }
+                Command::Join { .. } => {
+                    // JOIN is immediate even in transaction
+                    return self.execute_command(command);
+                }
                 Command::ShowTables => {
                     return self.execute_command(command);
                 }
@@ -357,7 +361,10 @@ impl<'a> Connection<'a> {
             Command::CreateTable { name, columns } => self.create_table(name, columns),
             Command::DropTable { name, if_exists } => self.drop_table(name, if_exists),
             Command::Insert { table, columns, values } => self.insert_multi(table, columns, values),
-            Command::Select { table, columns, where_clause, order_by, limit, offset, distinct } => {
+            Command::Select { table, columns, where_clause, group_by, having, order_by, limit, offset, distinct } => {
+                // GROUP BY not yet supported in concurrent module, ignoring for now
+                let _ = group_by;
+                let _ = having;
                 self.select(table, columns, where_clause.as_ref(), order_by.as_ref(), limit, offset, distinct)
             }
             Command::Update { table, assignments, where_clause } => {
@@ -365,6 +372,9 @@ impl<'a> Connection<'a> {
             }
             Command::Delete { table, where_clause } => self.delete(table, where_clause.as_ref()),
             Command::ShowTables => self.show_tables(),
+            Command::Join { .. } => {
+                Err(MarsError::InvalidFormat("JOIN not supported in concurrent module yet".into()))
+            }
         }
     }
 

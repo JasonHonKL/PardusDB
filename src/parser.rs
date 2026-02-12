@@ -32,10 +32,24 @@ pub enum Command {
         table: String,
         columns: Vec<SelectColumn>,
         where_clause: Option<WhereClause>,
+        group_by: Option<Vec<String>>,  // NEW: GROUP BY columns
+        having: Option<WhereClause>,    // NEW: HAVING clause
         order_by: Option<OrderBy>,
         limit: Option<usize>,
         offset: Option<usize>,
         distinct: bool,
+    },
+    Join {
+        left_table: String,
+        right_table: String,
+        join_type: JoinType,
+        left_column: String,   // Column from left table
+        right_column: String,  // Column from right table
+        columns: Vec<JoinColumn>,  // Columns to select
+        where_clause: Option<WhereClause>,
+        order_by: Option<OrderBy>,
+        limit: Option<usize>,
+        offset: Option<usize>,
     },
     Update {
         table: String,
@@ -47,6 +61,21 @@ pub enum Command {
         where_clause: Option<WhereClause>,
     },
     ShowTables,
+}
+
+/// JOIN types
+#[derive(Clone, Debug, PartialEq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Right,
+}
+
+/// Column selection for JOIN queries
+#[derive(Clone, Debug)]
+pub enum JoinColumn {
+    All,                              // *
+    TableColumn { table: String, column: String },  // table.column
 }
 
 /// Column selection - either a regular column or an aggregate function
@@ -73,6 +102,7 @@ pub struct ColumnDef {
     pub data_type: ColumnType,
     pub primary_key: bool,
     pub not_null: bool,
+    pub unique: bool,  // NEW: UNIQUE constraint
     pub default: Option<Value>,
 }
 
@@ -174,6 +204,7 @@ impl<'a> Parser<'a> {
 
             let mut primary_key = false;
             let mut not_null = false;
+            let mut unique = false;
             let mut default = None;
 
             loop {
@@ -188,6 +219,10 @@ impl<'a> Parser<'a> {
                         self.read_keyword()?;
                         self.expect_keyword("NULL")?;
                         not_null = true;
+                    }
+                    "UNIQUE" => {
+                        self.read_keyword()?;
+                        unique = true;
                     }
                     "DEFAULT" => {
                         self.read_keyword()?;
@@ -204,6 +239,7 @@ impl<'a> Parser<'a> {
                 data_type: col_type,
                 primary_key,
                 not_null,
+                unique,
                 default,
             });
 
@@ -307,16 +343,67 @@ impl<'a> Parser<'a> {
             self.skip_whitespace();
         }
 
-        // Columns
-        let mut columns = Vec::new();
-        if self.peek_char() == Some('*') {
+        // Columns - could be SelectColumn or JoinColumn depending on if JOIN is present
+        let mut select_columns = Vec::new();
+        let mut join_columns = Vec::new();
+        let is_star = self.peek_char() == Some('*');
+
+        if is_star {
             self.advance();
-            columns.push(SelectColumn::All);
+            select_columns.push(SelectColumn::All);
+            join_columns.push(JoinColumn::All);
         } else {
             loop {
                 self.skip_whitespace();
-                let col = self.parse_select_column()?;
-                columns.push(col);
+                // Check if it's a table.column format (for JOIN)
+                let col = self.read_identifier()?;
+                self.skip_whitespace();
+
+                if self.peek_char() == Some('.') {
+                    // It's table.column format
+                    self.advance(); // consume '.'
+                    self.skip_whitespace();
+                    let column_name = self.read_identifier()?;
+                    join_columns.push(JoinColumn::TableColumn {
+                        table: col.clone(),
+                        column: column_name.clone(),
+                    });
+                    // Also add as SelectColumn for non-JOIN case
+                    select_columns.push(SelectColumn::Column(column_name));
+                } else {
+                    // Regular column
+                    // Check if it's an aggregate function
+                    let col_upper = col.to_uppercase();
+                    if ["COUNT", "SUM", "AVG", "MIN", "MAX"].contains(&col_upper.as_str()) {
+                        // Parse aggregate function
+                        self.expect_char('(')?;
+                        self.skip_whitespace();
+                        let agg_col = if self.peek_char() == Some('*') {
+                            self.advance();
+                            "*".to_string()
+                        } else {
+                            self.read_identifier()?
+                        };
+                        self.skip_whitespace();
+                        self.expect_char(')')?;
+
+                        select_columns.push(SelectColumn::Aggregate {
+                            func: match col_upper.as_str() {
+                                "COUNT" => AggregateFunc::Count,
+                                "SUM" => AggregateFunc::Sum,
+                                "AVG" => AggregateFunc::Avg,
+                                "MIN" => AggregateFunc::Min,
+                                "MAX" => AggregateFunc::Max,
+                                _ => return Err(MarsError::InvalidFormat(format!("Unknown aggregate: {}", col))),
+                            },
+                            column: agg_col,
+                            alias: None,
+                        });
+                    } else {
+                        select_columns.push(SelectColumn::Column(col));
+                    }
+                }
+
                 self.skip_whitespace();
                 if self.peek_char() == Some(',') {
                     self.advance();
@@ -332,7 +419,27 @@ impl<'a> Parser<'a> {
         let table = self.read_identifier()?;
 
         self.skip_whitespace();
+
+        // Check for JOIN
+        let join_keyword = self.peek_keyword_upper();
+        if ["INNER", "LEFT", "RIGHT", "JOIN"].contains(&join_keyword.as_str()) {
+            return self.parse_join(table, join_columns);
+        }
+
+        // Regular SELECT without JOIN
         let where_clause = self.parse_where()?;
+
+        // GROUP BY
+        self.skip_whitespace();
+        let group_by = self.parse_group_by()?;
+
+        // HAVING
+        self.skip_whitespace();
+        let having = if group_by.is_some() {
+            self.parse_having()?
+        } else {
+            None
+        };
 
         self.skip_whitespace();
         let order_by = self.parse_order_by()?;
@@ -347,12 +454,104 @@ impl<'a> Parser<'a> {
 
         Ok(Command::Select {
             table,
+            columns: select_columns,
+            where_clause,
+            group_by,
+            having,
+            order_by,
+            limit,
+            offset,
+            distinct,
+        })
+    }
+
+    /// Parse JOIN clause (called from parse_select when JOIN is detected)
+    fn parse_join(&mut self, left_table: String, columns: Vec<JoinColumn>) -> Result<Command> {
+        self.skip_whitespace();
+
+        // Parse join type
+        let join_type = match self.peek_keyword_upper().as_str() {
+            "INNER" => {
+                self.read_keyword()?;
+                self.skip_whitespace();
+                self.expect_keyword("JOIN")?;
+                JoinType::Inner
+            }
+            "LEFT" => {
+                self.read_keyword()?;
+                self.skip_whitespace();
+                self.expect_keyword("JOIN")?;
+                JoinType::Left
+            }
+            "RIGHT" => {
+                self.read_keyword()?;
+                self.skip_whitespace();
+                self.expect_keyword("JOIN")?;
+                JoinType::Right
+            }
+            "JOIN" => {
+                self.read_keyword()?;
+                JoinType::Inner
+            }
+            _ => return Err(MarsError::InvalidFormat("Expected JOIN type".into())),
+        };
+
+        self.skip_whitespace();
+        let right_table = self.read_identifier()?;
+
+        self.skip_whitespace();
+        self.expect_keyword("ON")?;
+
+        self.skip_whitespace();
+        // Parse ON condition: table1.column = table2.column
+        let left_col_table = self.read_identifier()?;
+        self.skip_whitespace();
+        self.expect_char('.')?;
+        self.skip_whitespace();
+        let left_column = self.read_identifier()?;
+
+        self.skip_whitespace();
+        self.expect_char('=')?;
+
+        self.skip_whitespace();
+        let right_col_table = self.read_identifier()?;
+        self.skip_whitespace();
+        self.expect_char('.')?;
+        self.skip_whitespace();
+        let right_column = self.read_identifier()?;
+
+        // Validate that the tables in ON clause match our tables
+        let (left_col, right_col) = if left_col_table.to_lowercase() == left_table.to_lowercase() {
+            (left_column, right_column)
+        } else {
+            (right_column, left_column)
+        };
+
+        self.skip_whitespace();
+        let where_clause = self.parse_where()?;
+
+        self.skip_whitespace();
+        let order_by = self.parse_order_by()?;
+
+        self.skip_whitespace();
+        let limit = self.parse_limit()?;
+
+        self.skip_whitespace();
+        let offset = self.parse_offset()?;
+
+        self.skip_trailing_semicolon();
+
+        Ok(Command::Join {
+            left_table,
+            right_table,
+            join_type,
+            left_column: left_col,
+            right_column: right_col,
             columns,
             where_clause,
             order_by,
             limit,
             offset,
-            distinct,
         })
     }
 
@@ -676,6 +875,65 @@ impl<'a> Parser<'a> {
         }
 
         Ok(Some(OrderBy { column, ascending }))
+    }
+
+    // ==================== GROUP BY ====================
+    fn parse_group_by(&mut self) -> Result<Option<Vec<String>>> {
+        self.skip_whitespace();
+        if self.peek_keyword_upper() != "GROUP" {
+            return Ok(None);
+        }
+        self.read_keyword()?;
+        self.expect_keyword("BY")?;
+
+        let mut columns = Vec::new();
+        loop {
+            self.skip_whitespace();
+            columns.push(self.read_identifier()?);
+            self.skip_whitespace();
+            if self.peek_char() == Some(',') {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+
+        Ok(Some(columns))
+    }
+
+    // ==================== HAVING ====================
+    fn parse_having(&mut self) -> Result<Option<WhereClause>> {
+        self.skip_whitespace();
+        if self.peek_keyword_upper() != "HAVING" {
+            return Ok(None);
+        }
+        self.read_keyword()?;
+
+        // Reuse parse_where logic but for HAVING
+        let mut conditions = Vec::new();
+        let mut connectors = Vec::new();
+
+        loop {
+            self.skip_whitespace();
+            let condition = self.parse_condition()?;
+            conditions.push(condition);
+
+            self.skip_whitespace();
+            let connector = self.peek_keyword_upper();
+            match connector.as_str() {
+                "AND" => {
+                    self.read_keyword()?;
+                    connectors.push(BoolConnector::And);
+                }
+                "OR" => {
+                    self.read_keyword()?;
+                    connectors.push(BoolConnector::Or);
+                }
+                _ => break,
+            }
+        }
+
+        Ok(Some(WhereClause { conditions, connectors }))
     }
 
     fn parse_limit(&mut self) -> Result<Option<usize>> {
