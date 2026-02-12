@@ -78,7 +78,7 @@ pub use distance::{Distance, Numeric, Cosine, DotProduct, Euclidean};
 pub use error::{MarsError, Result};
 pub use graph::{Graph, GraphConfig};
 pub use node::{Candidate, Node, NodeId};
-pub use parser::{Command, ComparisonOp, parse};
+pub use parser::{AggregateFunc, BoolConnector, Command, ComparisonOp, Condition, ConditionValue, ColumnDef, OrderBy, SelectColumn, WhereClause, parse};
 pub use prepared::{BatchInserter, PreparedStatement, StatementCache};
 pub use schema::{Column, ColumnType, Row, Schema, Value};
 pub use table::Table;

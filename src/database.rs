@@ -1,15 +1,14 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Read, Seek, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MarsError, Result};
 use crate::graph::GraphConfig;
-use crate::parser::{Command, ComparisonOp, parse};
+use crate::parser::{Command, ComparisonOp, ConditionValue, OrderBy, SelectColumn, WhereClause, parse};
 use crate::schema::{Column, ColumnType, Row, Schema, Value};
-use crate::storage::{Header, Storage};
 use crate::table::Table;
 
 /// File header with database metadata
@@ -237,14 +236,14 @@ impl Database {
             Command::CreateTable { name, columns } => {
                 self.create_table(name, columns)
             }
-            Command::DropTable { name } => {
-                self.drop_table(name)
+            Command::DropTable { name, if_exists } => {
+                self.drop_table(name, if_exists)
             }
             Command::Insert { table, columns, values } => {
-                self.insert(table, columns, values)
+                self.insert_multi(table, columns, values)
             }
-            Command::Select { table, columns, where_clause, order_by, limit } => {
-                self.select(table, columns, where_clause.as_ref(), order_by.as_ref(), limit)
+            Command::Select { table, columns, where_clause, order_by, limit, offset, distinct } => {
+                self.select(table, columns, where_clause.as_ref(), order_by.as_ref(), limit, offset, distinct)
             }
             Command::Update { table, assignments, where_clause } => {
                 self.update(table, assignments, where_clause.as_ref())
@@ -284,28 +283,36 @@ impl Database {
         Ok(ExecuteResult::CreateTable { name })
     }
 
-    fn drop_table(&mut self, name: String) -> Result<ExecuteResult> {
+    fn drop_table(&mut self, name: String, if_exists: bool) -> Result<ExecuteResult> {
         if self.tables.remove(&name).is_none() {
+            if if_exists {
+                return Ok(ExecuteResult::DropTable { name });
+            }
             return Err(MarsError::InvalidFormat(format!("Table '{}' does not exist", name)));
         }
         Ok(ExecuteResult::DropTable { name })
     }
 
-    fn insert(&mut self, table_name: String, columns: Vec<String>, values: Vec<Value>) -> Result<ExecuteResult> {
+    fn insert_multi(&mut self, table_name: String, columns: Vec<String>, values: Vec<Vec<Value>>) -> Result<ExecuteResult> {
         let table = self.tables.get_mut(&table_name)
             .ok_or_else(|| MarsError::InvalidFormat(format!("Table '{}' does not exist", table_name)))?;
 
-        let id = table.insert(&columns, values)?;
-        Ok(ExecuteResult::Insert { id })
+        let mut last_id = 0u64;
+        for row_values in values {
+            last_id = table.insert(&columns, row_values)?;
+        }
+        Ok(ExecuteResult::Insert { id: last_id })
     }
 
     fn select(
         &self,
         table_name: String,
-        columns: Vec<String>,
-        where_clause: Option<&crate::parser::WhereClause>,
-        order_by: Option<&crate::parser::OrderBy>,
+        columns: Vec<SelectColumn>,
+        where_clause: Option<&WhereClause>,
+        order_by: Option<&OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
+        distinct: bool,
     ) -> Result<ExecuteResult> {
         let table = self.tables.get(&table_name)
             .ok_or_else(|| MarsError::InvalidFormat(format!("Table '{}' does not exist", table_name)))?;
@@ -314,7 +321,7 @@ impl Database {
         if let Some(wc) = where_clause {
             for cond in &wc.conditions {
                 if cond.operator == ComparisonOp::Similar {
-                    if let Value::Vector(query_vec) = &cond.value {
+                    if let ConditionValue::Single(Value::Vector(query_vec)) = &cond.value {
                         let k = limit.unwrap_or(10);
                         let results = table.select_by_similarity(query_vec, k, 100);
                         return Ok(ExecuteResult::SelectSimilar { results });
@@ -323,8 +330,120 @@ impl Database {
             }
         }
 
-        let rows = table.select(&columns, where_clause, limit);
+        // Check for aggregate functions
+        let has_aggregates = columns.iter().any(|c| matches!(c, SelectColumn::Aggregate { .. }));
+        if has_aggregates {
+            return self.execute_aggregates(table, &columns, where_clause);
+        }
+
+        // Convert SelectColumn to column names
+        let col_names: Vec<String> = columns.iter()
+            .filter_map(|c| match c {
+                SelectColumn::Column(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let is_star = columns.iter().any(|c| matches!(c, SelectColumn::All));
+
+        let rows = table.select(
+            if is_star { &[] } else { &col_names },
+            where_clause,
+            limit,
+            offset,
+            order_by,
+            distinct,
+        );
         Ok(ExecuteResult::Select { rows })
+    }
+
+    fn execute_aggregates(&self, table: &Table, columns: &[SelectColumn], where_clause: Option<&WhereClause>) -> Result<ExecuteResult> {
+        use crate::parser::AggregateFunc;
+
+        // Get matching rows
+        let matching_rows: Vec<&Row> = table.rows.values()
+            .filter(|row| table.matches_where(row, where_clause))
+            .collect();
+
+        let mut results = Vec::new();
+
+        for col in columns {
+            match col {
+                SelectColumn::Aggregate { func, column, alias } => {
+                    let value = match func {
+                        AggregateFunc::Count => {
+                            if column == "*" {
+                                Value::Integer(matching_rows.len() as i64)
+                            } else {
+                                let idx = table.column_index(column).unwrap_or(0);
+                                let count = matching_rows.iter()
+                                    .filter(|r| !matches!(r.values.get(idx), Some(Value::Null) | None))
+                                    .count();
+                                Value::Integer(count as i64)
+                            }
+                        }
+                        AggregateFunc::Sum => {
+                            let idx = table.column_index(column).unwrap_or(0);
+                            let sum: f64 = matching_rows.iter()
+                                .filter_map(|r| match r.values.get(idx) {
+                                    Some(Value::Integer(i)) => Some(*i as f64),
+                                    Some(Value::Float(f)) => Some(*f),
+                                    _ => None,
+                                })
+                                .sum();
+                            Value::Float(sum)
+                        }
+                        AggregateFunc::Avg => {
+                            let idx = table.column_index(column).unwrap_or(0);
+                            let values: Vec<f64> = matching_rows.iter()
+                                .filter_map(|r| match r.values.get(idx) {
+                                    Some(Value::Integer(i)) => Some(*i as f64),
+                                    Some(Value::Float(f)) => Some(*f),
+                                    _ => None,
+                                })
+                                .collect();
+                            if values.is_empty() {
+                                Value::Null
+                            } else {
+                                Value::Float(values.iter().sum::<f64>() / values.len() as f64)
+                            }
+                        }
+                        AggregateFunc::Min => {
+                            let idx = table.column_index(column).unwrap_or(0);
+                            matching_rows.iter()
+                                .filter_map(|r| r.values.get(idx))
+                                .filter(|v| !matches!(v, Value::Null))
+                                .min_by(|a, b| table.values_compare(a, b).unwrap_or(std::cmp::Ordering::Equal))
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        }
+                        AggregateFunc::Max => {
+                            let idx = table.column_index(column).unwrap_or(0);
+                            matching_rows.iter()
+                                .filter_map(|r| r.values.get(idx))
+                                .filter(|v| !matches!(v, Value::Null))
+                                .max_by(|a, b| table.values_compare(a, b).unwrap_or(std::cmp::Ordering::Equal))
+                                .cloned()
+                                .unwrap_or(Value::Null)
+                        }
+                    };
+
+                    let name = alias.clone().unwrap_or_else(|| format!("{:?}({})", func, column));
+                    results.push((name, value));
+                }
+                SelectColumn::Column(name) => {
+                    // For non-aggregate columns in aggregate query, take first value
+                    if let Some(row) = matching_rows.first() {
+                        if let Some(idx) = table.column_index(name) {
+                            results.push((name.clone(), row.values.get(idx).cloned().unwrap_or(Value::Null)));
+                        }
+                    }
+                }
+                SelectColumn::All => {}
+            }
+        }
+
+        Ok(ExecuteResult::Aggregate { results })
     }
 
     fn update(
@@ -383,6 +502,7 @@ pub enum ExecuteResult {
     Insert { id: u64 },
     Select { rows: Vec<Row> },
     SelectSimilar { results: Vec<(Row, f32)> },
+    Aggregate { results: Vec<(String, Value)> },
     Update { count: usize },
     Delete { count: usize },
     ShowTables { tables: Vec<TableInfo> },
@@ -413,6 +533,13 @@ impl std::fmt::Display for ExecuteResult {
                 writeln!(f, "Found {} similar rows:", results.len())?;
                 for (row, dist) in results {
                     writeln!(f, "  id={}, distance={:.4}, values={:?}", row.id, dist, row.values)?;
+                }
+                Ok(())
+            }
+            ExecuteResult::Aggregate { results } => {
+                writeln!(f, "Aggregate results:")?;
+                for (name, value) in results {
+                    writeln!(f, "  {} = {:?}", name, value)?;
                 }
                 Ok(())
             }

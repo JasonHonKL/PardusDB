@@ -1,10 +1,10 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use crate::distance::{Distance, Euclidean, Numeric};
+use crate::distance::{Distance, Euclidean};
 use crate::error::{MarsError, Result};
 use crate::graph::{Graph, GraphConfig};
 use crate::node::NodeId;
+use crate::parser::{BoolConnector, ComparisonOp, ConditionValue, OrderBy, SelectColumn, WhereClause};
 use crate::schema::{Column, ColumnType, Row, Schema, Value};
 
 /// A table in the database containing vectors and metadata
@@ -79,16 +79,46 @@ impl Table {
     pub fn select(
         &self,
         columns: &[String],
-        where_clause: Option<&crate::parser::WhereClause>,
+        where_clause: Option<&WhereClause>,
         limit: Option<usize>,
+        offset: Option<usize>,
+        order_by: Option<&OrderBy>,
+        distinct: bool,
     ) -> Vec<Row> {
         let mut results: Vec<&Row> = self.rows.values()
             .filter(|row| self.matches_where(row, where_clause))
             .collect();
 
-        // Apply limit
+        // Apply ORDER BY
+        if let Some(ob) = order_by {
+            if let Some(idx) = self.column_index(&ob.column) {
+                results.sort_by(|a, b| {
+                    let cmp = self.values_compare(&a.values[idx], &b.values[idx])
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if ob.ascending { cmp } else { cmp.reverse() }
+                });
+            }
+        }
+
+        // Apply OFFSET
+        if let Some(n) = offset {
+            results = results.into_iter().skip(n).collect();
+        }
+
+        // Apply LIMIT
         if let Some(n) = limit {
             results.truncate(n);
+        }
+
+        // Apply DISTINCT
+        if distinct {
+            let mut seen = std::collections::HashSet::new();
+            results = results.into_iter()
+                .filter(|row| {
+                    let key = format!("{:?}", row.values);
+                    seen.insert(key)
+                })
+                .collect();
         }
 
         // Project columns
@@ -121,7 +151,7 @@ impl Table {
     pub fn update(
         &mut self,
         assignments: &[(String, Value)],
-        where_clause: Option<&crate::parser::WhereClause>,
+        where_clause: Option<&WhereClause>,
     ) -> Result<usize> {
         let matching_ids: Vec<u64> = self.rows.values()
             .filter(|row| self.matches_where(row, where_clause))
@@ -151,7 +181,7 @@ impl Table {
     /// Delete rows matching conditions
     pub fn delete(
         &mut self,
-        where_clause: Option<&crate::parser::WhereClause>,
+        where_clause: Option<&WhereClause>,
     ) -> Result<usize> {
         let matching_ids: Vec<u64> = self.rows.values()
             .filter(|row| self.matches_where(row, where_clause))
@@ -208,39 +238,213 @@ impl Table {
     }
 
     /// Get column index by name
-    fn column_index(&self, name: &str) -> Option<usize> {
+    pub fn column_index(&self, name: &str) -> Option<usize> {
         self.schema.columns.iter().position(|c| c.name == name)
     }
 
-    /// Check if a row matches where clause
-    fn matches_where(&self, row: &Row, where_clause: Option<&crate::parser::WhereClause>) -> bool {
+    /// Check if a row matches where clause (supports AND/OR)
+    pub fn matches_where(&self, row: &Row, where_clause: Option<&WhereClause>) -> bool {
         match where_clause {
             None => true,
-            Some(wc) => wc.conditions.iter().all(|cond| {
-                let idx = match self.column_index(&cond.column) {
-                    Some(i) => i,
-                    None => return false,
-                };
+            Some(wc) => {
+                if wc.conditions.is_empty() {
+                    return true;
+                }
 
-                let row_val = &row.values[idx];
-                self.compare_values(row_val, &cond.operator, &cond.value)
-            }),
+                // Evaluate conditions with AND/OR connectors
+                let mut result = self.matches_condition(row, &wc.conditions[0]);
+
+                for (i, connector) in wc.connectors.iter().enumerate() {
+                    let cond_result = self.matches_condition(row, &wc.conditions[i + 1]);
+                    result = match connector {
+                        BoolConnector::And => result && cond_result,
+                        BoolConnector::Or => result || cond_result,
+                    };
+                }
+
+                result
+            }
         }
     }
 
-    /// Compare two values
-    fn compare_values(&self, a: &Value, op: &crate::parser::ComparisonOp, b: &Value) -> bool {
-        use crate::parser::ComparisonOp::*;
+    /// Check if a row matches a single condition
+    fn matches_condition(&self, row: &Row, cond: &crate::parser::Condition) -> bool {
+        let idx = match self.column_index(&cond.column) {
+            Some(i) => i,
+            None => return false,
+        };
 
+        let row_val = &row.values[idx];
+        self.evaluate_condition(row_val, &cond.operator, &cond.value)
+    }
+
+    /// Evaluate a condition against a value
+    fn evaluate_condition(&self, row_val: &Value, op: &ComparisonOp, cond_val: &ConditionValue) -> bool {
         match op {
-            Eq => self.values_equal(a, b),
-            Ne => !self.values_equal(a, b),
-            Lt => self.values_compare(a, b) == Some(std::cmp::Ordering::Less),
-            Le => self.values_compare(a, b).map(|o| o != std::cmp::Ordering::Greater).unwrap_or(false),
-            Gt => self.values_compare(a, b) == Some(std::cmp::Ordering::Greater),
-            Ge => self.values_compare(a, b).map(|o| o != std::cmp::Ordering::Less).unwrap_or(false),
-            Similar => false, // Similarity is handled separately
+            ComparisonOp::Eq => {
+                if let ConditionValue::Single(v) = cond_val {
+                    self.values_equal(row_val, v)
+                } else {
+                    false
+                }
+            }
+            ComparisonOp::Ne => {
+                if let ConditionValue::Single(v) = cond_val {
+                    !self.values_equal(row_val, v)
+                } else {
+                    true
+                }
+            }
+            ComparisonOp::Lt => {
+                if let ConditionValue::Single(v) = cond_val {
+                    self.values_compare(row_val, v) == Some(std::cmp::Ordering::Less)
+                } else {
+                    false
+                }
+            }
+            ComparisonOp::Le => {
+                if let ConditionValue::Single(v) = cond_val {
+                    self.values_compare(row_val, v).map(|o| o != std::cmp::Ordering::Greater).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            ComparisonOp::Gt => {
+                if let ConditionValue::Single(v) = cond_val {
+                    self.values_compare(row_val, v) == Some(std::cmp::Ordering::Greater)
+                } else {
+                    false
+                }
+            }
+            ComparisonOp::Ge => {
+                if let ConditionValue::Single(v) = cond_val {
+                    self.values_compare(row_val, v).map(|o| o != std::cmp::Ordering::Less).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            ComparisonOp::Similar => false, // Handled separately
+            ComparisonOp::Like => {
+                if let ConditionValue::Single(Value::Text(pattern)) = cond_val {
+                    self.match_like(row_val, pattern)
+                } else {
+                    false
+                }
+            }
+            ComparisonOp::NotLike => {
+                if let ConditionValue::Single(Value::Text(pattern)) = cond_val {
+                    !self.match_like(row_val, pattern)
+                } else {
+                    true
+                }
+            }
+            ComparisonOp::In => {
+                if let ConditionValue::List(values) = cond_val {
+                    values.iter().any(|v| self.values_equal(row_val, v))
+                } else {
+                    false
+                }
+            }
+            ComparisonOp::NotIn => {
+                if let ConditionValue::List(values) = cond_val {
+                    !values.iter().any(|v| self.values_equal(row_val, v))
+                } else {
+                    true
+                }
+            }
+            ComparisonOp::Between => {
+                if let ConditionValue::Range(low, high) = cond_val {
+                    self.values_compare(row_val, low).map(|o| o != std::cmp::Ordering::Less).unwrap_or(false)
+                        && self.values_compare(row_val, high).map(|o| o != std::cmp::Ordering::Greater).unwrap_or(false)
+                } else {
+                    false
+                }
+            }
+            ComparisonOp::NotBetween => {
+                if let ConditionValue::Range(low, high) = cond_val {
+                    !(self.values_compare(row_val, low).map(|o| o != std::cmp::Ordering::Less).unwrap_or(false)
+                        && self.values_compare(row_val, high).map(|o| o != std::cmp::Ordering::Greater).unwrap_or(false))
+                } else {
+                    true
+                }
+            }
+            ComparisonOp::IsNull => {
+                matches!(row_val, Value::Null)
+            }
+            ComparisonOp::IsNotNull => {
+                !matches!(row_val, Value::Null)
+            }
         }
+    }
+
+    /// Match LIKE pattern (supports % and _)
+    fn match_like(&self, value: &Value, pattern: &str) -> bool {
+        match value {
+            Value::Text(s) => self.like_match(s, pattern),
+            _ => false,
+        }
+    }
+
+    /// Simple LIKE pattern matching
+    fn like_match(&self, text: &str, pattern: &str) -> bool {
+        // Convert SQL LIKE pattern to regex-like matching
+        let text_lower = text.to_lowercase();
+        let pattern_lower = pattern.to_lowercase();
+
+        // Handle common cases efficiently
+        if pattern_lower.starts_with('%') && pattern_lower.ends_with('%') {
+            // %pattern% - contains
+            let middle = &pattern_lower[1..pattern_lower.len()-1];
+            text_lower.contains(middle)
+        } else if pattern_lower.starts_with('%') {
+            // %pattern - ends with
+            let suffix = &pattern_lower[1..];
+            text_lower.ends_with(suffix)
+        } else if pattern_lower.ends_with('%') {
+            // pattern% - starts with
+            let prefix = &pattern_lower[..pattern_lower.len()-1];
+            text_lower.starts_with(prefix)
+        } else if pattern_lower.contains('%') || pattern_lower.contains('_') {
+            // Complex pattern - use simple wildcard matching
+            self.wildcard_match(&text_lower, &pattern_lower)
+        } else {
+            // Exact match
+            text_lower == pattern_lower
+        }
+    }
+
+    /// Wildcard matching for LIKE patterns
+    fn wildcard_match(&self, text: &str, pattern: &str) -> bool {
+        let text_chars: Vec<char> = text.chars().collect();
+        let pattern_chars: Vec<char> = pattern.chars().collect();
+
+        let mut ti = 0;
+        let mut pi = 0;
+        let mut star_ti = None;
+        let mut star_pi = None;
+
+        while ti < text_chars.len() {
+            if pi < pattern_chars.len() && (pattern_chars[pi] == '_' || pattern_chars[pi].to_lowercase().next() == text_chars[ti].to_lowercase().next()) {
+                ti += 1;
+                pi += 1;
+            } else if pi < pattern_chars.len() && pattern_chars[pi] == '%' {
+                star_ti = Some(ti);
+                star_pi = Some(pi);
+                pi += 1;
+            } else if let Some(star) = star_ti {
+                ti = star + 1;
+                star_ti = Some(ti);
+                pi = star_pi.unwrap() + 1;
+            } else {
+                return false;
+            }
+        }
+
+        while pi < pattern_chars.len() && pattern_chars[pi] == '%' {
+            pi += 1;
+        }
+
+        pi == pattern_chars.len()
     }
 
     fn values_equal(&self, a: &Value, b: &Value) -> bool {
@@ -256,7 +460,7 @@ impl Table {
         }
     }
 
-    fn values_compare(&self, a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    pub fn values_compare(&self, a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
         match (a, b) {
             (Value::Integer(i1), Value::Integer(i2)) => i1.partial_cmp(i2),
             (Value::Float(f1), Value::Float(f2)) => f1.partial_cmp(f2),
@@ -333,7 +537,7 @@ mod tests {
             vec![Value::Vector(vec![0.0, 1.0, 0.0]), Value::Text("Second".to_string())],
         ).unwrap();
 
-        let rows = table.select(&[], None, None);
+        let rows = table.select(&[], None, None, None, None, false);
         assert_eq!(rows.len(), 2);
     }
 }

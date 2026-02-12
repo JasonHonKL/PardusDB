@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use crate::error::{MarsError, Result};
 use crate::schema::Value;
-use crate::parser::{parse, Command, ColumnDef, WhereClause, Condition, ComparisonOp, OrderBy};
+use crate::parser::{parse, Command, WhereClause, Condition, ComparisonOp, OrderBy, SelectColumn, ConditionValue, BoolConnector};
 
 /// A prepared statement template that can be reused with different parameters
 #[derive(Clone, Debug)]
@@ -30,10 +30,12 @@ pub enum CommandTemplate {
     },
     Select {
         table: String,
-        columns: Vec<String>,
+        columns: Vec<SelectColumn>,
         where_template: Option<WhereClauseTemplate>,
         order_by: Option<OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
+        distinct: bool,
     },
     Update {
         table: String,
@@ -138,10 +140,10 @@ impl PreparedStatement {
                 Ok(Command::Insert {
                     table: table.clone(),
                     columns: columns.clone(),
-                    values,
+                    values: vec![values],  // Single row insert
                 })
             }
-            CommandTemplate::Select { table, columns, where_template, order_by, limit } => {
+            CommandTemplate::Select { table, columns, where_template, order_by, limit, offset, distinct } => {
                 let where_clause = where_template.as_ref()
                     .map(|wt| Self::resolve_where(wt, params))
                     .transpose()?;
@@ -151,6 +153,8 @@ impl PreparedStatement {
                     where_clause,
                     order_by: order_by.clone(),
                     limit: *limit,
+                    offset: *offset,
+                    distinct: *distinct,
                 })
             }
             CommandTemplate::Update { table, assignment_templates, where_template } => {
@@ -279,25 +283,22 @@ impl PreparedStatement {
     fn convert_command(command: Command, _templates: &[ValueTemplate]) -> CommandTemplate {
         match command {
             Command::Insert { table, columns, values } => {
-                // For now, convert all values to templates based on index
-                let value_templates = values.into_iter()
-                    .enumerate()
-                    .map(|(i, v)| {
-                        // Check if original SQL had ? at this position
-                        // For simplicity, we'll just use fixed values
-                        // A full implementation would track parameter positions
-                        ValueTemplate::Fixed(v)
-                    })
+                // For single-row insert, take first row
+                let first_row = values.into_iter().next().unwrap_or_default();
+                let value_templates = first_row.into_iter()
+                    .map(|v| ValueTemplate::Fixed(v))
                     .collect();
                 CommandTemplate::Insert { table, columns, value_templates }
             }
-            Command::Select { table, columns, where_clause, order_by, limit } => {
+            Command::Select { table, columns, where_clause, order_by, limit, offset, distinct } => {
                 CommandTemplate::Select {
                     table,
                     columns,
                     where_template: where_clause.map(|wc| Self::convert_where(wc)),
                     order_by,
                     limit,
+                    offset,
+                    distinct,
                 }
             }
             Command::Update { table, assignments, where_clause } => {
@@ -322,10 +323,19 @@ impl PreparedStatement {
     fn convert_where(wc: WhereClause) -> WhereClauseTemplate {
         WhereClauseTemplate {
             conditions: wc.conditions.into_iter()
-                .map(|c| ConditionTemplate {
-                    column: c.column,
-                    operator: c.operator,
-                    value_template: ValueTemplate::Fixed(c.value),
+                .map(|c| {
+                    // Convert ConditionValue to simple value for template
+                    let value = match c.value {
+                        ConditionValue::Single(v) => v,
+                        ConditionValue::List(mut v) => v.pop().unwrap_or(Value::Null),
+                        ConditionValue::Range(low, _) => low,
+                        ConditionValue::NullCheck => Value::Null,
+                    };
+                    ConditionTemplate {
+                        column: c.column,
+                        operator: c.operator,
+                        value_template: ValueTemplate::Fixed(value),
+                    }
                 })
                 .collect(),
         }
@@ -347,9 +357,10 @@ impl PreparedStatement {
                 .map(|c| Ok(Condition {
                     column: c.column.clone(),
                     operator: c.operator.clone(),
-                    value: Self::resolve_value(&c.value_template, params)?,
+                    value: ConditionValue::Single(Self::resolve_value(&c.value_template, params)?),
                 }))
                 .collect::<Result<Vec<_>>>()?,
+            connectors: Vec::new(),  // Simple AND-only for now
         })
     }
 }

@@ -1,6 +1,6 @@
 //! Integration tests for SQL parsing
 
-use pardusdb::{parse, Command, ColumnType, Value, ComparisonOp};
+use pardusdb::{parse, Command, ColumnType, Value, ComparisonOp, ConditionValue, SelectColumn};
 
 #[test]
 fn test_parse_create_table() {
@@ -45,9 +45,10 @@ fn test_parse_insert() {
         Command::Insert { table, columns, values } => {
             assert_eq!(table, "users");
             assert_eq!(columns, vec!["name", "age"]);
-            assert_eq!(values.len(), 2);
-            assert_eq!(values[0], Value::Text("Alice".to_string()));
-            assert_eq!(values[1], Value::Integer(30));
+            assert_eq!(values.len(), 1);  // One row
+            assert_eq!(values[0].len(), 2);  // Two values per row
+            assert_eq!(values[0][0], Value::Text("Alice".to_string()));
+            assert_eq!(values[0][1], Value::Integer(30));
         }
         _ => panic!("Expected Insert"),
     }
@@ -61,8 +62,24 @@ fn test_parse_insert_with_vector() {
     match cmd {
         Command::Insert { table, columns, values } => {
             assert_eq!(table, "docs");
-            assert_eq!(values[0], Value::Vector(vec![0.1, 0.2, 0.3]));
-            assert_eq!(values[1], Value::Text("Test".to_string()));
+            assert_eq!(values[0][0], Value::Vector(vec![0.1, 0.2, 0.3]));
+            assert_eq!(values[0][1], Value::Text("Test".to_string()));
+        }
+        _ => panic!("Expected Insert"),
+    }
+}
+
+#[test]
+fn test_parse_insert_multirow() {
+    let sql = "INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25);";
+    let cmd = parse(sql).unwrap();
+
+    match cmd {
+        Command::Insert { table, columns, values } => {
+            assert_eq!(table, "users");
+            assert_eq!(values.len(), 2);  // Two rows
+            assert_eq!(values[0][0], Value::Text("Alice".to_string()));
+            assert_eq!(values[1][0], Value::Text("Bob".to_string()));
         }
         _ => panic!("Expected Insert"),
     }
@@ -76,7 +93,7 @@ fn test_parse_select_all() {
     match cmd {
         Command::Select { table, columns, where_clause, limit, .. } => {
             assert_eq!(table, "users");
-            assert!(columns.is_empty()); // * means empty vec
+            assert!(matches!(columns[0], SelectColumn::All));
             assert!(where_clause.is_none());
             assert!(limit.is_none());
         }
@@ -92,7 +109,8 @@ fn test_parse_select_columns() {
     match cmd {
         Command::Select { table, columns, limit, .. } => {
             assert_eq!(table, "users");
-            assert_eq!(columns, vec!["name", "age"]);
+            assert!(matches!(columns[0], SelectColumn::Column(ref s) if s == "name"));
+            assert!(matches!(columns[1], SelectColumn::Column(ref s) if s == "age"));
             assert_eq!(limit, Some(10));
         }
         _ => panic!("Expected Select"),
@@ -111,7 +129,11 @@ fn test_parse_select_where() {
             assert_eq!(wc.conditions.len(), 1);
             assert_eq!(wc.conditions[0].column, "id");
             assert_eq!(wc.conditions[0].operator, ComparisonOp::Eq);
-            assert_eq!(wc.conditions[0].value, Value::Integer(1));
+            if let ConditionValue::Single(v) = &wc.conditions[0].value {
+                assert_eq!(v, &Value::Integer(1));
+            } else {
+                panic!("Expected Single value");
+            }
         }
         _ => panic!("Expected Select"),
     }
@@ -142,8 +164,115 @@ fn test_parse_select_similarity() {
         Command::Select { where_clause, limit, .. } => {
             let wc = where_clause.unwrap();
             assert_eq!(wc.conditions[0].operator, ComparisonOp::Similar);
-            assert_eq!(wc.conditions[0].value, Value::Vector(vec![0.1, 0.2]));
+            if let ConditionValue::Single(v) = &wc.conditions[0].value {
+                assert_eq!(v, &Value::Vector(vec![0.1, 0.2]));
+            } else {
+                panic!("Expected Single value");
+            }
             assert_eq!(limit, Some(5));
+        }
+        _ => panic!("Expected Select"),
+    }
+}
+
+#[test]
+fn test_parse_select_like() {
+    let sql = "SELECT * FROM users WHERE name LIKE 'John%';";
+    let cmd = parse(sql).unwrap();
+
+    match cmd {
+        Command::Select { where_clause, .. } => {
+            let wc = where_clause.unwrap();
+            assert_eq!(wc.conditions[0].operator, ComparisonOp::Like);
+        }
+        _ => panic!("Expected Select"),
+    }
+}
+
+#[test]
+fn test_parse_select_in() {
+    let sql = "SELECT * FROM users WHERE id IN (1, 2, 3);";
+    let cmd = parse(sql).unwrap();
+
+    match cmd {
+        Command::Select { where_clause, .. } => {
+            let wc = where_clause.unwrap();
+            assert_eq!(wc.conditions[0].operator, ComparisonOp::In);
+            if let ConditionValue::List(values) = &wc.conditions[0].value {
+                assert_eq!(values.len(), 3);
+            } else {
+                panic!("Expected List value");
+            }
+        }
+        _ => panic!("Expected Select"),
+    }
+}
+
+#[test]
+fn test_parse_select_between() {
+    let sql = "SELECT * FROM products WHERE price BETWEEN 10 AND 100;";
+    let cmd = parse(sql).unwrap();
+
+    match cmd {
+        Command::Select { where_clause, .. } => {
+            let wc = where_clause.unwrap();
+            assert_eq!(wc.conditions[0].operator, ComparisonOp::Between);
+        }
+        _ => panic!("Expected Select"),
+    }
+}
+
+#[test]
+fn test_parse_select_is_null() {
+    let sql = "SELECT * FROM users WHERE deleted_at IS NULL;";
+    let cmd = parse(sql).unwrap();
+
+    match cmd {
+        Command::Select { where_clause, .. } => {
+            let wc = where_clause.unwrap();
+            assert_eq!(wc.conditions[0].operator, ComparisonOp::IsNull);
+        }
+        _ => panic!("Expected Select"),
+    }
+}
+
+#[test]
+fn test_parse_select_distinct() {
+    let sql = "SELECT DISTINCT category FROM products;";
+    let cmd = parse(sql).unwrap();
+
+    match cmd {
+        Command::Select { distinct, .. } => {
+            assert!(distinct);
+        }
+        _ => panic!("Expected Select"),
+    }
+}
+
+#[test]
+fn test_parse_select_offset() {
+    let sql = "SELECT * FROM users LIMIT 10 OFFSET 20;";
+    let cmd = parse(sql).unwrap();
+
+    match cmd {
+        Command::Select { limit, offset, .. } => {
+            assert_eq!(limit, Some(10));
+            assert_eq!(offset, Some(20));
+        }
+        _ => panic!("Expected Select"),
+    }
+}
+
+#[test]
+fn test_parse_select_aggregate() {
+    let sql = "SELECT COUNT(*), AVG(score) FROM users;";
+    let cmd = parse(sql).unwrap();
+
+    match cmd {
+        Command::Select { columns, .. } => {
+            assert_eq!(columns.len(), 2);
+            assert!(matches!(columns[0], SelectColumn::Aggregate { .. }));
+            assert!(matches!(columns[1], SelectColumn::Aggregate { .. }));
         }
         _ => panic!("Expected Select"),
     }
@@ -193,8 +322,23 @@ fn test_parse_drop_table() {
     let cmd = parse(sql).unwrap();
 
     match cmd {
-        Command::DropTable { name } => {
+        Command::DropTable { name, if_exists } => {
             assert_eq!(name, "users");
+            assert!(!if_exists);
+        }
+        _ => panic!("Expected DropTable"),
+    }
+}
+
+#[test]
+fn test_parse_drop_table_if_exists() {
+    let sql = "DROP TABLE IF EXISTS users;";
+    let cmd = parse(sql).unwrap();
+
+    match cmd {
+        Command::DropTable { name, if_exists } => {
+            assert_eq!(name, "users");
+            assert!(if_exists);
         }
         _ => panic!("Expected DropTable"),
     }
@@ -218,7 +362,7 @@ fn test_parse_value_types() {
         let cmd = parse(&sql).unwrap();
         match cmd {
             Command::Insert { values, .. } => {
-                assert_eq!(values[0], expected);
+                assert_eq!(values[0][0], expected);
             }
             _ => panic!("Expected Insert"),
         }
@@ -246,5 +390,20 @@ fn test_parse_comparison_operators() {
             }
             _ => panic!("Expected Select"),
         }
+    }
+}
+
+#[test]
+fn test_parse_where_or() {
+    let sql = "SELECT * FROM users WHERE id = 1 OR id = 2;";
+    let cmd = parse(sql).unwrap();
+
+    match cmd {
+        Command::Select { where_clause, .. } => {
+            let wc = where_clause.unwrap();
+            assert_eq!(wc.conditions.len(), 2);
+            assert_eq!(wc.connectors.len(), 1);
+        }
+        _ => panic!("Expected Select"),
     }
 }

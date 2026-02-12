@@ -1,9 +1,18 @@
-use std::fmt;
+//! Enhanced SQL parser for PardusDB
+//!
+//! Supports a comprehensive subset of SQL including:
+//! - CREATE TABLE, DROP TABLE
+//! - INSERT (single and multi-row)
+//! - SELECT with WHERE, ORDER BY, LIMIT, OFFSET, DISTINCT
+//! - UPDATE, DELETE
+//! - Aggregate functions: COUNT, SUM, AVG, MIN, MAX
+//! - LIKE, IN, BETWEEN, IS NULL, IS NOT NULL
+//! - AND, OR in WHERE clauses
 
 use crate::error::{MarsError, Result};
-use crate::schema::{ColumnType, Schema, Value};
+use crate::schema::{ColumnType, Value};
 
-/// SQL-like command types
+/// SQL command types
 #[derive(Clone, Debug)]
 pub enum Command {
     CreateTable {
@@ -12,18 +21,21 @@ pub enum Command {
     },
     DropTable {
         name: String,
+        if_exists: bool,
     },
     Insert {
         table: String,
         columns: Vec<String>,
-        values: Vec<Value>,
+        values: Vec<Vec<Value>>,  // Support multiple rows
     },
     Select {
         table: String,
-        columns: Vec<String>,  // empty means *
+        columns: Vec<SelectColumn>,
         where_clause: Option<WhereClause>,
         order_by: Option<OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
+        distinct: bool,
     },
     Update {
         table: String,
@@ -37,24 +49,58 @@ pub enum Command {
     ShowTables,
 }
 
+/// Column selection - either a regular column or an aggregate function
+#[derive(Clone, Debug)]
+pub enum SelectColumn {
+    All,                           // *
+    Column(String),                // column_name
+    Aggregate { func: AggregateFunc, column: String, alias: Option<String> },
+}
+
+/// Aggregate function types
+#[derive(Clone, Debug, PartialEq)]
+pub enum AggregateFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
 #[derive(Clone, Debug)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: ColumnType,
     pub primary_key: bool,
     pub not_null: bool,
+    pub default: Option<Value>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WhereClause {
+    pub conditions: Vec<Condition>,
+    pub connectors: Vec<BoolConnector>,  // AND/OR between conditions
 }
 
 #[derive(Clone, Debug)]
-pub struct WhereClause {
-    pub conditions: Vec<Condition>,
+pub enum BoolConnector {
+    And,
+    Or,
 }
 
 #[derive(Clone, Debug)]
 pub struct Condition {
     pub column: String,
     pub operator: ComparisonOp,
-    pub value: Value,
+    pub value: ConditionValue,
+}
+
+#[derive(Clone, Debug)]
+pub enum ConditionValue {
+    Single(Value),
+    List(Vec<Value>),       // For IN clause
+    Range(Value, Value),    // For BETWEEN
+    NullCheck,              // For IS NULL / IS NOT NULL
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -65,7 +111,15 @@ pub enum ComparisonOp {
     Le,
     Gt,
     Ge,
-    Similar,  // For vector similarity
+    Similar,    // Vector similarity
+    Like,       // Pattern matching
+    NotLike,
+    In,         // IN clause
+    NotIn,
+    Between,    // BETWEEN
+    NotBetween,
+    IsNull,     // IS NULL
+    IsNotNull,  // IS NOT NULL
 }
 
 #[derive(Clone, Debug)]
@@ -74,7 +128,7 @@ pub struct OrderBy {
     pub ascending: bool,
 }
 
-/// Simple SQL-like parser
+/// High-performance SQL parser
 pub struct Parser<'a> {
     input: &'a str,
     pos: usize,
@@ -87,10 +141,9 @@ impl<'a> Parser<'a> {
 
     pub fn parse(&mut self) -> Result<Command> {
         self.skip_whitespace();
+        let keyword = self.read_keyword_upper()?;
 
-        let keyword = self.read_keyword()?;
-
-        match keyword.to_uppercase().as_str() {
+        match keyword.as_str() {
             "CREATE" => self.parse_create(),
             "DROP" => self.parse_drop(),
             "INSERT" => self.parse_insert(),
@@ -102,13 +155,9 @@ impl<'a> Parser<'a> {
         }
     }
 
+    // ==================== CREATE TABLE ====================
     fn parse_create(&mut self) -> Result<Command> {
-        self.skip_whitespace();
-        let next = self.read_keyword()?;
-        if next.to_uppercase() != "TABLE" {
-            return Err(MarsError::InvalidFormat("Expected TABLE after CREATE".into()));
-        }
-
+        self.expect_keyword("TABLE")?;
         self.skip_whitespace();
         let name = self.read_identifier()?;
 
@@ -118,36 +167,32 @@ impl<'a> Parser<'a> {
         let mut columns = Vec::new();
         loop {
             self.skip_whitespace();
-
             let col_name = self.read_identifier()?;
             self.skip_whitespace();
-
             let col_type = self.parse_column_type()?;
             self.skip_whitespace();
 
             let mut primary_key = false;
             let mut not_null = false;
+            let mut default = None;
 
             loop {
-                let keyword = self.peek_keyword();
-                match keyword.to_uppercase().as_str() {
+                let keyword = self.peek_keyword_upper();
+                match keyword.as_str() {
                     "PRIMARY" => {
                         self.read_keyword()?;
-                        self.skip_whitespace();
-                        let key_kw = self.read_keyword()?;
-                        if key_kw.to_uppercase() != "KEY" {
-                            return Err(MarsError::InvalidFormat("Expected KEY after PRIMARY".into()));
-                        }
+                        self.expect_keyword("KEY")?;
                         primary_key = true;
                     }
                     "NOT" => {
                         self.read_keyword()?;
-                        self.skip_whitespace();
-                        let null_kw = self.read_keyword()?;
-                        if null_kw.to_uppercase() != "NULL" {
-                            return Err(MarsError::InvalidFormat("Expected NULL after NOT".into()));
-                        }
+                        self.expect_keyword("NULL")?;
                         not_null = true;
+                    }
+                    "DEFAULT" => {
+                        self.read_keyword()?;
+                        self.skip_whitespace();
+                        default = Some(self.parse_value()?);
                     }
                     _ => break,
                 }
@@ -159,6 +204,7 @@ impl<'a> Parser<'a> {
                 data_type: col_type,
                 primary_key,
                 not_null,
+                default,
             });
 
             self.skip_whitespace();
@@ -169,39 +215,33 @@ impl<'a> Parser<'a> {
             self.expect_char(',')?;
         }
 
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
-
+        self.skip_trailing_semicolon();
         Ok(Command::CreateTable { name, columns })
     }
 
+    // ==================== DROP TABLE ====================
     fn parse_drop(&mut self) -> Result<Command> {
+        self.expect_keyword("TABLE")?;
         self.skip_whitespace();
-        let next = self.read_keyword()?;
-        if next.to_uppercase() != "TABLE" {
-            return Err(MarsError::InvalidFormat("Expected TABLE after DROP".into()));
-        }
 
-        self.skip_whitespace();
+        let if_exists = if self.peek_keyword_upper() == "IF" {
+            self.read_keyword()?;
+            self.expect_keyword("EXISTS")?;
+            self.skip_whitespace();
+            true
+        } else {
+            false
+        };
+
         let name = self.read_identifier()?;
+        self.skip_trailing_semicolon();
 
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
-
-        Ok(Command::DropTable { name })
+        Ok(Command::DropTable { name, if_exists })
     }
 
+    // ==================== INSERT ====================
     fn parse_insert(&mut self) -> Result<Command> {
-        self.skip_whitespace();
-        let into = self.read_keyword()?;
-        if into.to_uppercase() != "INTO" {
-            return Err(MarsError::InvalidFormat("Expected INTO after INSERT".into()));
-        }
-
+        self.expect_keyword("INTO")?;
         self.skip_whitespace();
         let table = self.read_identifier()?;
 
@@ -223,44 +263,60 @@ impl<'a> Parser<'a> {
         }
 
         self.skip_whitespace();
-        let values_kw = self.read_keyword()?;
-        if values_kw.to_uppercase() != "VALUES" {
-            return Err(MarsError::InvalidFormat("Expected VALUES".into()));
-        }
+        self.expect_keyword("VALUES")?;
 
-        self.skip_whitespace();
-        self.expect_char('(')?;
-
-        let mut values = Vec::new();
+        let mut all_values = Vec::new();
         loop {
             self.skip_whitespace();
-            values.push(self.parse_value()?);
-            self.skip_whitespace();
-            if self.peek_char() == Some(')') {
-                self.advance();
-                break;
+            self.expect_char('(')?;
+
+            let mut values = Vec::new();
+            loop {
+                self.skip_whitespace();
+                values.push(self.parse_value()?);
+                self.skip_whitespace();
+                if self.peek_char() == Some(')') {
+                    self.advance();
+                    break;
+                }
+                self.expect_char(',')?;
             }
-            self.expect_char(',')?;
+            all_values.push(values);
+
+            self.skip_whitespace();
+            if self.peek_char() == Some(',') {
+                self.advance();
+                continue;
+            }
+            break;
         }
 
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
-
-        Ok(Command::Insert { table, columns, values })
+        self.skip_trailing_semicolon();
+        Ok(Command::Insert { table, columns, values: all_values })
     }
 
+    // ==================== SELECT ====================
     fn parse_select(&mut self) -> Result<Command> {
         self.skip_whitespace();
 
+        // DISTINCT
+        let mut distinct = false;
+        if self.peek_keyword_upper() == "DISTINCT" {
+            self.read_keyword()?;
+            distinct = true;
+            self.skip_whitespace();
+        }
+
+        // Columns
         let mut columns = Vec::new();
         if self.peek_char() == Some('*') {
             self.advance();
+            columns.push(SelectColumn::All);
         } else {
             loop {
                 self.skip_whitespace();
-                columns.push(self.read_identifier()?);
+                let col = self.parse_select_column()?;
+                columns.push(col);
                 self.skip_whitespace();
                 if self.peek_char() == Some(',') {
                     self.advance();
@@ -271,11 +327,7 @@ impl<'a> Parser<'a> {
         }
 
         self.skip_whitespace();
-        let from = self.read_keyword()?;
-        if from.to_uppercase() != "FROM" {
-            return Err(MarsError::InvalidFormat("Expected FROM".into()));
-        }
-
+        self.expect_keyword("FROM")?;
         self.skip_whitespace();
         let table = self.read_identifier()?;
 
@@ -289,9 +341,9 @@ impl<'a> Parser<'a> {
         let limit = self.parse_limit()?;
 
         self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
+        let offset = self.parse_offset()?;
+
+        self.skip_trailing_semicolon();
 
         Ok(Command::Select {
             table,
@@ -299,18 +351,63 @@ impl<'a> Parser<'a> {
             where_clause,
             order_by,
             limit,
+            offset,
+            distinct,
         })
     }
 
+    fn parse_select_column(&mut self) -> Result<SelectColumn> {
+        let keyword = self.peek_keyword_upper();
+
+        // Check for aggregate functions
+        match keyword.as_str() {
+            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => {
+                let func = match keyword.as_str() {
+                    "COUNT" => AggregateFunc::Count,
+                    "SUM" => AggregateFunc::Sum,
+                    "AVG" => AggregateFunc::Avg,
+                    "MIN" => AggregateFunc::Min,
+                    "MAX" => AggregateFunc::Max,
+                    _ => unreachable!(),
+                };
+                self.read_keyword()?;
+                self.skip_whitespace();
+                self.expect_char('(')?;
+                self.skip_whitespace();
+
+                let column = if self.peek_char() == Some('*') {
+                    self.advance();
+                    "*".to_string()
+                } else {
+                    self.read_identifier()?
+                };
+
+                self.skip_whitespace();
+                self.expect_char(')')?;
+
+                // Check for alias
+                self.skip_whitespace();
+                let alias = if self.peek_keyword_upper() == "AS" {
+                    self.read_keyword()?;
+                    self.skip_whitespace();
+                    Some(self.read_identifier()?)
+                } else {
+                    None
+                };
+
+                Ok(SelectColumn::Aggregate { func, column, alias })
+            }
+            _ => Ok(SelectColumn::Column(self.read_identifier()?))
+        }
+    }
+
+    // ==================== UPDATE ====================
     fn parse_update(&mut self) -> Result<Command> {
         self.skip_whitespace();
         let table = self.read_identifier()?;
 
         self.skip_whitespace();
-        let set = self.read_keyword()?;
-        if set.to_uppercase() != "SET" {
-            return Err(MarsError::InvalidFormat("Expected SET".into()));
-        }
+        self.expect_keyword("SET")?;
 
         let mut assignments = Vec::new();
         loop {
@@ -333,132 +430,182 @@ impl<'a> Parser<'a> {
         self.skip_whitespace();
         let where_clause = self.parse_where()?;
 
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
-
-        Ok(Command::Update {
-            table,
-            assignments,
-            where_clause,
-        })
+        self.skip_trailing_semicolon();
+        Ok(Command::Update { table, assignments, where_clause })
     }
 
+    // ==================== DELETE ====================
     fn parse_delete(&mut self) -> Result<Command> {
-        self.skip_whitespace();
-        let from = self.read_keyword()?;
-        if from.to_uppercase() != "FROM" {
-            return Err(MarsError::InvalidFormat("Expected FROM".into()));
-        }
-
+        self.expect_keyword("FROM")?;
         self.skip_whitespace();
         let table = self.read_identifier()?;
 
         self.skip_whitespace();
         let where_clause = self.parse_where()?;
 
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
-
+        self.skip_trailing_semicolon();
         Ok(Command::Delete { table, where_clause })
     }
 
+    // ==================== SHOW ====================
     fn parse_show(&mut self) -> Result<Command> {
-        self.skip_whitespace();
-        let tables = self.read_keyword()?;
-        if tables.to_uppercase() != "TABLES" {
-            return Err(MarsError::InvalidFormat("Expected TABLES after SHOW".into()));
-        }
-
-        self.skip_whitespace();
-        if self.peek_char() == Some(';') {
-            self.advance();
-        }
-
+        self.expect_keyword("TABLES")?;
+        self.skip_trailing_semicolon();
         Ok(Command::ShowTables)
     }
 
+    // ==================== WHERE CLAUSE ====================
     fn parse_where(&mut self) -> Result<Option<WhereClause>> {
         self.skip_whitespace();
-        let keyword = self.peek_keyword();
-        if keyword.to_uppercase() != "WHERE" {
+        if self.peek_keyword_upper() != "WHERE" {
             return Ok(None);
         }
         self.read_keyword()?;
 
         let mut conditions = Vec::new();
+        let mut connectors = Vec::new();
+
         loop {
             self.skip_whitespace();
-            let column = self.read_identifier()?;
-            self.skip_whitespace();
-
-            let operator = self.parse_comparison_op()?;
-            self.skip_whitespace();
-
-            let value = self.parse_value()?;
-            conditions.push(Condition {
-                column,
-                operator,
-                value,
-            });
+            let condition = self.parse_condition()?;
+            conditions.push(condition);
 
             self.skip_whitespace();
-            let and_or = self.peek_keyword();
-            if and_or.to_uppercase() == "AND" {
-                self.read_keyword()?;
-                continue;
+            let connector = self.peek_keyword_upper();
+            match connector.as_str() {
+                "AND" => {
+                    self.read_keyword()?;
+                    connectors.push(BoolConnector::And);
+                }
+                "OR" => {
+                    self.read_keyword()?;
+                    connectors.push(BoolConnector::Or);
+                }
+                _ => break,
             }
-            break;
         }
 
-        Ok(Some(WhereClause { conditions }))
+        Ok(Some(WhereClause { conditions, connectors }))
     }
 
-    fn parse_order_by(&mut self) -> Result<Option<OrderBy>> {
-        self.skip_whitespace();
-        let keyword = self.peek_keyword();
-        if keyword.to_uppercase() != "ORDER" {
-            return Ok(None);
-        }
-        self.read_keyword()?;
-
-        self.skip_whitespace();
-        let by = self.read_keyword()?;
-        if by.to_uppercase() != "BY" {
-            return Err(MarsError::InvalidFormat("Expected BY after ORDER".into()));
-        }
-
+    fn parse_condition(&mut self) -> Result<Condition> {
         self.skip_whitespace();
         let column = self.read_identifier()?;
-
         self.skip_whitespace();
-        let mut ascending = true;
-        let dir = self.peek_keyword();
-        if dir.to_uppercase() == "ASC" {
+
+        // Check for IS NULL / IS NOT NULL
+        let keyword = self.peek_keyword_upper();
+        if keyword == "IS" {
             self.read_keyword()?;
-            ascending = true;
-        } else if dir.to_uppercase() == "DESC" {
-            self.read_keyword()?;
-            ascending = false;
+            self.skip_whitespace();
+
+            let is_not = if self.peek_keyword_upper() == "NOT" {
+                self.read_keyword()?;
+                self.skip_whitespace();
+                true
+            } else {
+                false
+            };
+
+            self.expect_keyword("NULL")?;
+
+            return Ok(Condition {
+                column,
+                operator: if is_not { ComparisonOp::IsNotNull } else { ComparisonOp::IsNull },
+                value: ConditionValue::NullCheck,
+            });
         }
 
-        Ok(Some(OrderBy { column, ascending }))
-    }
+        // Check for NOT prefix (NOT IN, NOT BETWEEN, NOT LIKE)
+        let negated = if keyword == "NOT" {
+            self.read_keyword()?;
+            self.skip_whitespace();
+            true
+        } else {
+            false
+        };
 
-    fn parse_limit(&mut self) -> Result<Option<usize>> {
-        self.skip_whitespace();
-        let keyword = self.peek_keyword();
-        if keyword.to_uppercase() != "LIMIT" {
-            return Ok(None);
+        let next_keyword = self.peek_keyword_upper();
+
+        // IN clause
+        if next_keyword == "IN" {
+            self.read_keyword()?;
+            self.skip_whitespace();
+            self.expect_char('(')?;
+
+            let mut values = Vec::new();
+            loop {
+                self.skip_whitespace();
+                values.push(self.parse_value()?);
+                self.skip_whitespace();
+                if self.peek_char() == Some(')') {
+                    self.advance();
+                    break;
+                }
+                self.expect_char(',')?;
+            }
+
+            return Ok(Condition {
+                column,
+                operator: if negated { ComparisonOp::NotIn } else { ComparisonOp::In },
+                value: ConditionValue::List(values),
+            });
         }
-        self.read_keyword()?;
 
+        // BETWEEN
+        if next_keyword == "BETWEEN" {
+            self.read_keyword()?;
+            self.skip_whitespace();
+            let low = self.parse_value()?;
+
+            self.skip_whitespace();
+            self.expect_keyword("AND")?;
+            self.skip_whitespace();
+            let high = self.parse_value()?;
+
+            return Ok(Condition {
+                column,
+                operator: if negated { ComparisonOp::NotBetween } else { ComparisonOp::Between },
+                value: ConditionValue::Range(low, high),
+            });
+        }
+
+        // LIKE
+        if next_keyword == "LIKE" {
+            self.read_keyword()?;
+            self.skip_whitespace();
+            let pattern = self.parse_value()?;
+
+            return Ok(Condition {
+                column,
+                operator: if negated { ComparisonOp::NotLike } else { ComparisonOp::Like },
+                value: ConditionValue::Single(pattern),
+            });
+        }
+
+        // SIMILARITY (for vectors)
+        if next_keyword == "SIMILARITY" {
+            self.read_keyword()?;
+            self.skip_whitespace();
+            let vec = self.parse_value()?;
+
+            return Ok(Condition {
+                column,
+                operator: ComparisonOp::Similar,
+                value: ConditionValue::Single(vec),
+            });
+        }
+
+        // Standard comparison operators
+        let operator = self.parse_comparison_op()?;
         self.skip_whitespace();
-        let n = self.read_number()? as usize;
-        Ok(Some(n))
+        let value = self.parse_value()?;
+
+        Ok(Condition {
+            column,
+            operator,
+            value: ConditionValue::Single(value),
+        })
     }
 
     fn parse_comparison_op(&mut self) -> Result<ComparisonOp> {
@@ -471,18 +618,22 @@ impl<'a> Parser<'a> {
                 self.advance();
                 Ok(ComparisonOp::Eq)
             }
-            '!' => {
-                self.advance();
-                self.expect_char('=')?;
-                Ok(ComparisonOp::Ne)
-            }
-            '<' => {
-                self.advance();
-                if self.peek_char() == Some('=') {
+            '!' | '<' => {
+                if ch == '!' {
                     self.advance();
-                    Ok(ComparisonOp::Le)
+                    self.expect_char('=')?;
+                    Ok(ComparisonOp::Ne)
                 } else {
-                    Ok(ComparisonOp::Lt)
+                    self.advance();
+                    if self.peek_char() == Some('=') {
+                        self.advance();
+                        Ok(ComparisonOp::Le)
+                    } else if self.peek_char() == Some('>') {
+                        self.advance();
+                        Ok(ComparisonOp::Ne)
+                    } else {
+                        Ok(ComparisonOp::Lt)
+                    }
                 }
             }
             '>' => {
@@ -494,18 +645,62 @@ impl<'a> Parser<'a> {
                     Ok(ComparisonOp::Gt)
                 }
             }
-            _ => {
-                // Check for SIMILARITY keyword
-                let kw = self.peek_keyword();
-                if kw.to_uppercase() == "SIMILARITY" {
-                    self.read_keyword()?;
-                    return Ok(ComparisonOp::Similar);
-                }
-                Err(MarsError::InvalidFormat(format!("Expected comparison operator, got {}", ch)))
-            }
+            _ => Err(MarsError::InvalidFormat(format!("Expected comparison operator, got '{}'", ch)))
         }
     }
 
+    // ==================== ORDER BY, LIMIT, OFFSET ====================
+    fn parse_order_by(&mut self) -> Result<Option<OrderBy>> {
+        self.skip_whitespace();
+        if self.peek_keyword_upper() != "ORDER" {
+            return Ok(None);
+        }
+        self.read_keyword()?;
+        self.expect_keyword("BY")?;
+
+        self.skip_whitespace();
+        let column = self.read_identifier()?;
+
+        self.skip_whitespace();
+        let mut ascending = true;
+        match self.peek_keyword_upper().as_str() {
+            "ASC" => {
+                self.read_keyword()?;
+                ascending = true;
+            }
+            "DESC" => {
+                self.read_keyword()?;
+                ascending = false;
+            }
+            _ => {}
+        }
+
+        Ok(Some(OrderBy { column, ascending }))
+    }
+
+    fn parse_limit(&mut self) -> Result<Option<usize>> {
+        self.skip_whitespace();
+        if self.peek_keyword_upper() != "LIMIT" {
+            return Ok(None);
+        }
+        self.read_keyword()?;
+        self.skip_whitespace();
+        let n = self.read_integer()? as usize;
+        Ok(Some(n))
+    }
+
+    fn parse_offset(&mut self) -> Result<Option<usize>> {
+        self.skip_whitespace();
+        if self.peek_keyword_upper() != "OFFSET" {
+            return Ok(None);
+        }
+        self.read_keyword()?;
+        self.skip_whitespace();
+        let n = self.read_integer()? as usize;
+        Ok(Some(n))
+    }
+
+    // ==================== VALUE PARSING ====================
     fn parse_value(&mut self) -> Result<Value> {
         self.skip_whitespace();
 
@@ -521,41 +716,27 @@ impl<'a> Parser<'a> {
             }
             '[' => {
                 self.advance();
-                let mut nums = Vec::new();
-                loop {
-                    self.skip_whitespace();
-                    if self.peek_char() == Some(']') {
-                        self.advance();
-                        break;
-                    }
-                    let n = self.read_number()?;
-                    nums.push(n as f32);
-                    self.skip_whitespace();
-                    if self.peek_char() == Some(',') {
-                        self.advance();
-                    }
-                }
+                let nums = self.read_vector_content()?;
                 Ok(Value::Vector(nums))
             }
-            't' | 'f' => {
-                let kw = self.read_keyword()?;
-                match kw.to_lowercase().as_str() {
-                    "true" => Ok(Value::Boolean(true)),
-                    "false" => Ok(Value::Boolean(false)),
-                    "null" => Ok(Value::Null),
+            't' | 'T' | 'f' | 'F' => {
+                let kw = self.read_keyword_upper()?;
+                match kw.as_str() {
+                    "TRUE" => Ok(Value::Boolean(true)),
+                    "FALSE" => Ok(Value::Boolean(false)),
                     _ => Err(MarsError::InvalidFormat(format!("Unknown keyword: {}", kw))),
                 }
             }
-            'n' => {
-                let kw = self.read_keyword()?;
-                if kw.to_lowercase() == "null" {
+            'n' | 'N' => {
+                let kw = self.read_keyword_upper()?;
+                if kw == "NULL" {
                     Ok(Value::Null)
                 } else {
                     Err(MarsError::InvalidFormat(format!("Unknown keyword: {}", kw)))
                 }
             }
             '-' | '0'..='9' => {
-                let (n, has_decimal) = self.read_number_with_decimal()?;
+                let (n, has_decimal) = self.read_number()?;
                 if has_decimal {
                     Ok(Value::Float(n))
                 } else {
@@ -566,29 +747,48 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_column_type(&mut self) -> Result<ColumnType> {
-        let type_name = self.read_keyword()?;
+    fn read_vector_content(&mut self) -> Result<Vec<f32>> {
+        let mut nums = Vec::new();
+        loop {
+            self.skip_whitespace();
+            if self.peek_char() == Some(']') {
+                self.advance();
+                break;
+            }
+            let (n, _) = self.read_number()?;
+            nums.push(n as f32);
+            self.skip_whitespace();
+            if self.peek_char() == Some(',') {
+                self.advance();
+            }
+        }
+        Ok(nums)
+    }
 
-        match type_name.to_uppercase().as_str() {
+    fn parse_column_type(&mut self) -> Result<ColumnType> {
+        let type_name = self.read_keyword_upper()?;
+
+        match type_name.as_str() {
             "VECTOR" => {
                 self.skip_whitespace();
                 self.expect_char('(')?;
                 self.skip_whitespace();
-                let dim = self.read_number()? as usize;
+                let dim = self.read_integer()? as usize;
                 self.skip_whitespace();
                 self.expect_char(')')?;
                 Ok(ColumnType::Vector(dim))
             }
-            "TEXT" | "VARCHAR" | "STRING" => Ok(ColumnType::Text),
-            "INTEGER" | "INT" => Ok(ColumnType::Integer),
-            "FLOAT" | "REAL" | "DOUBLE" => Ok(ColumnType::Float),
+            "TEXT" | "VARCHAR" | "STRING" | "CHAR" => Ok(ColumnType::Text),
+            "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" => Ok(ColumnType::Integer),
+            "FLOAT" | "REAL" | "DOUBLE" | "DECIMAL" | "NUMERIC" => Ok(ColumnType::Float),
             "BOOLEAN" | "BOOL" => Ok(ColumnType::Boolean),
-            "BLOB" => Ok(ColumnType::Blob),
+            "BLOB" | "BINARY" => Ok(ColumnType::Blob),
             _ => Err(MarsError::InvalidFormat(format!("Unknown type: {}", type_name))),
         }
     }
 
-    // Helper methods
+    // ==================== LOW-LEVEL HELPERS ====================
+
     fn skip_whitespace(&mut self) {
         while let Some(ch) = self.peek_char() {
             if ch.is_whitespace() {
@@ -596,6 +796,13 @@ impl<'a> Parser<'a> {
             } else {
                 break;
             }
+        }
+    }
+
+    fn skip_trailing_semicolon(&mut self) {
+        self.skip_whitespace();
+        if self.peek_char() == Some(';') {
+            self.advance();
         }
     }
 
@@ -620,24 +827,25 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn peek_keyword(&self) -> String {
+    fn peek_keyword_upper(&self) -> String {
         let start = self.pos;
         let mut end = start;
         for ch in self.input[start..].chars() {
-            if ch.is_alphanumeric() || ch == '_' {
+            if ch.is_alphanumeric() || ch == '_' || ch == '*' {
                 end += ch.len_utf8();
             } else {
                 break;
             }
         }
-        self.input[start..end].to_string()
+        self.input[start..end].to_uppercase()
     }
 
     fn read_keyword(&mut self) -> Result<String> {
+        self.skip_whitespace();  // Skip leading whitespace
         let start = self.pos;
         let mut end = start;
         for ch in self.input[start..].chars() {
-            if ch.is_alphanumeric() || ch == '_' {
+            if ch.is_alphanumeric() || ch == '_' || ch == '*' {
                 end += ch.len_utf8();
             } else {
                 break;
@@ -651,16 +859,29 @@ impl<'a> Parser<'a> {
         Ok(keyword)
     }
 
+    fn read_keyword_upper(&mut self) -> Result<String> {
+        let kw = self.read_keyword()?;
+        Ok(kw.to_uppercase())
+    }
+
+    fn expect_keyword(&mut self, expected: &str) -> Result<()> {
+        let kw = self.read_keyword_upper()?;
+        if kw != expected.to_uppercase() {
+            return Err(MarsError::InvalidFormat(format!("Expected '{}', got '{}'", expected, kw)));
+        }
+        Ok(())
+    }
+
     fn read_identifier(&mut self) -> Result<String> {
         self.read_keyword()
     }
 
-    fn read_number(&mut self) -> Result<f64> {
-        let (n, _) = self.read_number_with_decimal()?;
-        Ok(n)
+    fn read_integer(&mut self) -> Result<i64> {
+        let (n, _) = self.read_number()?;
+        Ok(n as i64)
     }
 
-    fn read_number_with_decimal(&mut self) -> Result<(f64, bool)> {
+    fn read_number(&mut self) -> Result<(f64, bool)> {
         let start = self.pos;
         let mut end = start;
         let mut has_dot = false;
@@ -695,6 +916,16 @@ impl<'a> Parser<'a> {
                 MarsError::InvalidFormat("Unterminated string".into())
             })?;
             if ch == quote {
+                // Check for escaped quote ('')
+                let next_pos = self.pos + quote.len_utf8();
+                if next_pos < self.input.len() {
+                    let next_char = self.input[next_pos..].chars().next();
+                    if next_char == Some(quote) {
+                        result.push(quote);
+                        self.pos = next_pos + quote.len_utf8();
+                        continue;
+                    }
+                }
                 self.advance();
                 break;
             }
@@ -707,6 +938,9 @@ impl<'a> Parser<'a> {
                     'n' => result.push('\n'),
                     't' => result.push('\t'),
                     'r' => result.push('\r'),
+                    '\\' => result.push('\\'),
+                    '\'' => result.push('\''),
+                    '"' => result.push('"'),
                     _ => result.push(escaped),
                 }
                 self.advance();
@@ -719,7 +953,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-/// Parse a SQL-like command string
+/// Parse a SQL command string
 pub fn parse(input: &str) -> Result<Command> {
     Parser::new(input).parse()
 }
@@ -745,52 +979,159 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_insert() {
-        let sql = "INSERT INTO documents (embedding, title) VALUES ([0.1, 0.2, 0.3], 'Test Title');";
+    fn test_parse_insert_multirow() {
+        let sql = "INSERT INTO docs (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c');";
         let cmd = parse(sql).unwrap();
 
         match cmd {
             Command::Insert { table, columns, values } => {
-                assert_eq!(table, "documents");
-                assert_eq!(columns, vec!["embedding", "title"]);
-                assert_eq!(values.len(), 2);
+                assert_eq!(table, "docs");
+                assert_eq!(values.len(), 3);
             }
             _ => panic!("Expected Insert"),
         }
     }
 
     #[test]
-    fn test_parse_select() {
-        let sql = "SELECT * FROM documents WHERE id = 1 LIMIT 10;";
+    fn test_parse_select_aggregate() {
+        let sql = "SELECT COUNT(*), AVG(score) FROM users;";
         let cmd = parse(sql).unwrap();
 
         match cmd {
-            Command::Select { table, limit, .. } => {
-                assert_eq!(table, "documents");
-                assert_eq!(limit, Some(10));
+            Command::Select { columns, .. } => {
+                assert_eq!(columns.len(), 2);
+                assert!(matches!(columns[0], SelectColumn::Aggregate { func: AggregateFunc::Count, .. }));
+                assert!(matches!(columns[1], SelectColumn::Aggregate { func: AggregateFunc::Avg, .. }));
             }
             _ => panic!("Expected Select"),
         }
     }
 
     #[test]
-    fn test_parse_delete() {
-        let sql = "DELETE FROM documents WHERE id = 5;";
+    fn test_parse_select_distinct() {
+        let sql = "SELECT DISTINCT category FROM products;";
         let cmd = parse(sql).unwrap();
 
         match cmd {
-            Command::Delete { table, where_clause } => {
-                assert_eq!(table, "documents");
-                assert!(where_clause.is_some());
+            Command::Select { distinct, .. } => {
+                assert!(distinct);
             }
-            _ => panic!("Expected Delete"),
+            _ => panic!("Expected Select"),
         }
     }
 
     #[test]
-    fn test_parse_show_tables() {
-        let sql = "SHOW TABLES;";
+    fn test_parse_where_like() {
+        let sql = "SELECT * FROM users WHERE name LIKE 'John%';";
         let cmd = parse(sql).unwrap();
-        assert!(matches!(cmd, Command::ShowTables));
+
+        match cmd {
+            Command::Select { where_clause: Some(wc), .. } => {
+                assert_eq!(wc.conditions.len(), 1);
+                assert_eq!(wc.conditions[0].operator, ComparisonOp::Like);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_in() {
+        let sql = "SELECT * FROM users WHERE id IN (1, 2, 3);";
+        let cmd = parse(sql).unwrap();
+
+        match cmd {
+            Command::Select { where_clause: Some(wc), .. } => {
+                assert_eq!(wc.conditions[0].operator, ComparisonOp::In);
+                if let ConditionValue::List(values) = &wc.conditions[0].value {
+                    assert_eq!(values.len(), 3);
+                } else {
+                    panic!("Expected List");
+                }
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_between() {
+        let sql = "SELECT * FROM products WHERE price BETWEEN 10 AND 100;";
+        let cmd = parse(sql).unwrap();
+
+        match cmd {
+            Command::Select { where_clause: Some(wc), .. } => {
+                assert_eq!(wc.conditions[0].operator, ComparisonOp::Between);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_is_null() {
+        let sql = "SELECT * FROM users WHERE deleted_at IS NULL;";
+        let cmd = parse(sql).unwrap();
+
+        match cmd {
+            Command::Select { where_clause: Some(wc), .. } => {
+                assert_eq!(wc.conditions[0].operator, ComparisonOp::IsNull);
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_where_or() {
+        let sql = "SELECT * FROM users WHERE id = 1 OR id = 2;";
+        let cmd = parse(sql).unwrap();
+
+        match cmd {
+            Command::Select { where_clause: Some(wc), .. } => {
+                assert_eq!(wc.conditions.len(), 2);
+                assert_eq!(wc.connectors.len(), 1);
+                assert!(matches!(wc.connectors[0], BoolConnector::Or));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_limit_offset() {
+        let sql = "SELECT * FROM users LIMIT 10 OFFSET 20;";
+        let cmd = parse(sql).unwrap();
+
+        match cmd {
+            Command::Select { limit, offset, .. } => {
+                assert_eq!(limit, Some(10));
+                assert_eq!(offset, Some(20));
+            }
+            _ => panic!("Expected Select"),
+        }
+    }
+
+    #[test]
+    fn test_parse_drop_if_exists() {
+        let sql = "DROP TABLE IF EXISTS temp;";
+        let cmd = parse(sql).unwrap();
+
+        match cmd {
+            Command::DropTable { name, if_exists } => {
+                assert_eq!(name, "temp");
+                assert!(if_exists);
+            }
+            _ => panic!("Expected DropTable"),
+        }
+    }
+
+    #[test]
+    fn test_parse_order_by_desc() {
+        let sql = "SELECT * FROM products ORDER BY price DESC;";
+        let cmd = parse(sql).unwrap();
+
+        match cmd {
+            Command::Select { order_by: Some(ob), .. } => {
+                assert_eq!(ob.column, "price");
+                assert!(!ob.ascending);
+            }
+            _ => panic!("Expected Select"),
+        }
     }
 }

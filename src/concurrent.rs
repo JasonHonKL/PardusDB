@@ -305,8 +305,8 @@ struct TransactionState {
 /// A pending operation in a transaction.
 enum PendingOperation {
     CreateTable { name: String, columns: Vec<crate::parser::ColumnDef> },
-    DropTable { name: String },
-    Insert { table: String, columns: Vec<String>, values: Vec<Value> },
+    DropTable { name: String, if_exists: bool },
+    Insert { table: String, columns: Vec<String>, values: Vec<Vec<Value>> },
     Update { table: String, assignments: Vec<(String, Value)>, where_clause: Option<crate::parser::WhereClause> },
     Delete { table: String, where_clause: Option<crate::parser::WhereClause> },
 }
@@ -325,8 +325,8 @@ impl<'a> Connection<'a> {
                 Command::CreateTable { name, columns } => {
                     PendingOperation::CreateTable { name, columns }
                 }
-                Command::DropTable { name } => {
-                    PendingOperation::DropTable { name }
+                Command::DropTable { name, if_exists } => {
+                    PendingOperation::DropTable { name, if_exists }
                 }
                 Command::Insert { table, columns, values } => {
                     PendingOperation::Insert { table, columns, values }
@@ -355,10 +355,10 @@ impl<'a> Connection<'a> {
     fn execute_command(&mut self, command: Command) -> Result<ExecuteResult> {
         match command {
             Command::CreateTable { name, columns } => self.create_table(name, columns),
-            Command::DropTable { name } => self.drop_table(name),
-            Command::Insert { table, columns, values } => self.insert(table, columns, values),
-            Command::Select { table, columns, where_clause, order_by, limit } => {
-                self.select(table, columns, where_clause.as_ref(), order_by.as_ref(), limit)
+            Command::DropTable { name, if_exists } => self.drop_table(name, if_exists),
+            Command::Insert { table, columns, values } => self.insert_multi(table, columns, values),
+            Command::Select { table, columns, where_clause, order_by, limit, offset, distinct } => {
+                self.select(table, columns, where_clause.as_ref(), order_by.as_ref(), limit, offset, distinct)
             }
             Command::Update { table, assignments, where_clause } => {
                 self.update(table, assignments, where_clause.as_ref())
@@ -421,8 +421,8 @@ impl<'a> Connection<'a> {
             PendingOperation::CreateTable { name, columns } => {
                 Self::create_table_inner(inner, name, columns)
             }
-            PendingOperation::DropTable { name } => {
-                Self::drop_table_inner(inner, name)
+            PendingOperation::DropTable { name, if_exists } => {
+                Self::drop_table_inner(inner, name, if_exists)
             }
             PendingOperation::Insert { table, columns, values } => {
                 Self::insert_inner(inner, table, columns, values)
@@ -466,8 +466,8 @@ impl<'a> Connection<'a> {
         Ok(ExecuteResult::CreateTable { name })
     }
 
-    fn drop_table_inner(inner: &mut DatabaseInner, name: String) -> Result<ExecuteResult> {
-        if inner.tables.remove(&name).is_none() {
+    fn drop_table_inner(inner: &mut DatabaseInner, name: String, if_exists: bool) -> Result<ExecuteResult> {
+        if inner.tables.remove(&name).is_none() && !if_exists {
             return Err(MarsError::InvalidFormat(format!("Table '{}' does not exist", name)));
         }
         Ok(ExecuteResult::DropTable { name })
@@ -477,13 +477,16 @@ impl<'a> Connection<'a> {
         inner: &mut DatabaseInner,
         table_name: String,
         columns: Vec<String>,
-        values: Vec<Value>,
+        values: Vec<Vec<Value>>,
     ) -> Result<ExecuteResult> {
         let table = inner.tables.get_mut(&table_name)
             .ok_or_else(|| MarsError::InvalidFormat(format!("Table '{}' does not exist", table_name)))?;
 
-        let id = table.insert(&columns, values)?;
-        Ok(ExecuteResult::Insert { id })
+        let mut last_id = 0u64;
+        for row_values in values {
+            last_id = table.insert(&columns, row_values)?;
+        }
+        Ok(ExecuteResult::Insert { id: last_id })
     }
 
     fn update_inner(
@@ -516,12 +519,12 @@ impl<'a> Connection<'a> {
         Self::create_table_inner(&mut guard, name, columns)
     }
 
-    fn drop_table(&mut self, name: String) -> Result<ExecuteResult> {
+    fn drop_table(&mut self, name: String, if_exists: bool) -> Result<ExecuteResult> {
         let mut guard = self.db.inner.write().unwrap();
-        Self::drop_table_inner(&mut guard, name)
+        Self::drop_table_inner(&mut guard, name, if_exists)
     }
 
-    fn insert(&mut self, table: String, columns: Vec<String>, values: Vec<Value>) -> Result<ExecuteResult> {
+    fn insert_multi(&mut self, table: String, columns: Vec<String>, values: Vec<Vec<Value>>) -> Result<ExecuteResult> {
         let mut guard = self.db.inner.write().unwrap();
         Self::insert_inner(&mut guard, table, columns, values)
     }
@@ -529,10 +532,12 @@ impl<'a> Connection<'a> {
     fn select(
         &self,
         table_name: String,
-        columns: Vec<String>,
+        columns: Vec<crate::parser::SelectColumn>,
         where_clause: Option<&crate::parser::WhereClause>,
-        _order_by: Option<&crate::parser::OrderBy>,
+        order_by: Option<&crate::parser::OrderBy>,
         limit: Option<usize>,
+        offset: Option<usize>,
+        distinct: bool,
     ) -> Result<ExecuteResult> {
         let guard = self.db.inner.read().unwrap();
 
@@ -543,7 +548,7 @@ impl<'a> Connection<'a> {
         if let Some(wc) = where_clause {
             for cond in &wc.conditions {
                 if cond.operator == ComparisonOp::Similar {
-                    if let Value::Vector(query_vec) = &cond.value {
+                    if let crate::parser::ConditionValue::Single(Value::Vector(query_vec)) = &cond.value {
                         let k = limit.unwrap_or(10);
                         let results = table.select_by_similarity(query_vec, k, 100);
                         return Ok(ExecuteResult::SelectSimilar { results });
@@ -552,7 +557,24 @@ impl<'a> Connection<'a> {
             }
         }
 
-        let rows = table.select(&columns, where_clause, limit);
+        // Convert SelectColumn to column names
+        let col_names: Vec<String> = columns.iter()
+            .filter_map(|c| match c {
+                crate::parser::SelectColumn::Column(name) => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let is_star = columns.iter().any(|c| matches!(c, crate::parser::SelectColumn::All));
+
+        let rows = table.select(
+            if is_star { &[] } else { &col_names },
+            where_clause,
+            limit,
+            offset,
+            order_by,
+            distinct,
+        );
         Ok(ExecuteResult::Select { rows })
     }
 
