@@ -1,0 +1,48 @@
+{
+  "name": "pardusdb",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for PardusDB - A fast, SQLite-like embedded vector database",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "npm run build",
+    "test": "jest",
+    "lint": "eslint src/**/*.ts",
+    "clean": "rm -rf dist"
+  },
+  "keywords": [
+    "vector",
+    "database",
+    "embeddings",
+    "similarity-search",
+    "rag",
+    "ai",
+    "typescript"
+  ],
+  "author": "Pardus AI <hello@pardusai.org>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pardus-ai/pardusdb",
+    "directory": "sdk/typescript/pardusdb"
+  },
+  "bugs": {
+    "url": "https://github.com/pardus-ai/pardusdb/issues"
+  },
+  "homepage": "https://github.com/pardus-ai/pardusdb#readme",
+  "devDependencies": {
+    "@types/jest": "^29.5.0",
+    "@types/node": "^20.0.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.1.0",
+    "typescript": "^5.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
