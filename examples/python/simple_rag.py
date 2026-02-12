@@ -3,30 +3,34 @@
 Simple RAG Example with PardusDB and Ollama (Python)
 
 This example demonstrates a basic RAG workflow:
-1. Create a PardusDB database (test.pardus)
+1. Create a PardusDB database
 2. Get embeddings from Ollama
-3. Store documents with embeddings
-4. Query similar documents
+3. Store documents with embeddings in PardusDB
+4. Query similar documents using PardusDB's vector search
 
 Prerequisites:
 - Build pardusdb: cargo build --release
 - Install Ollama: https://ollama.ai
-- Pull model: ollama pull embeddinggemma (or nomic-embed-text)
+- Pull model: ollama pull nomic-embed-text
 - Install requests: pip install requests
 
 Run: python simple_rag.py
 """
 import os
+import json
+import subprocess
+import tempfile
 import requests
+from typing import List, Tuple
 
 # Configuration
-DB_PATH = "test.pardus"
-PARDUSDB_BIN = "../target/release/pardusdb"
+DB_PATH = "rag_db.pardus"
+PARDUSDB_BIN = os.path.join(os.path.dirname(__file__), "..", "..", "target", "release", "pardusdb")
 OLLAMA_URL = "http://localhost:11434/api/embed"
-OLLAMA_MODEL = "embeddinggemma"  # or "nomic-embed-text"
+OLLAMA_MODEL = "nomic-embed-text"  # or "embeddinggemma"
 
 
-def get_embedding(text: str) -> list[float]:
+def get_embedding(text: str) -> List[float]:
     """Get embedding from Ollama."""
     response = requests.post(OLLAMA_URL, json={
         "model": OLLAMA_MODEL,
@@ -37,36 +41,111 @@ def get_embedding(text: str) -> list[float]:
     return data["embeddings"][0]
 
 
-def create_database():
-    """Create a new PardusDB database."""
-    # Remove existing database
-    if os.path.exists(DB_PATH):
-        os.remove(DB_PATH)
+class PardusDB:
+    """Simple wrapper for PardusDB using subprocess."""
 
-    # Create database using pardusdb binary
-    # The binary creates tables on first SQL execution
-    print(f"Creating database: {DB_PATH}")
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        # Remove existing database
+        if os.path.exists(db_path):
+            os.remove(db_path)
 
-    # We'll create the table via the library approach
-    # For now, just ensure the binary exists
-    if not os.path.exists(PARDUSDB_BIN):
-        print(f"Error: {PARDUSDB_BIN} not found.")
-        print("Run: cargo build --release")
-        return False
+    def execute(self, sql: str) -> str:
+        """Execute SQL command and return output."""
+        # Create a temporary file with the SQL command
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.sql', delete=False) as f:
+            f.write(sql)
+            f.write("\n")
+            temp_path = f.name
 
-    return True
+        try:
+            # Run pardusdb with the SQL file
+            result = subprocess.run(
+                [PARDUSDB_BIN, self.db_path],
+                input=sql + "\n",
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            return result.stdout + result.stderr
+        except subprocess.TimeoutExpired:
+            return "Error: Command timed out"
+        except Exception as e:
+            return f"Error: {e}"
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def create_table(self, table_name: str, embedding_dim: int):
+        """Create a table with vector column."""
+        sql = f"CREATE TABLE {table_name} (embedding VECTOR({embedding_dim}), content TEXT);"
+        return self.execute(sql)
+
+    def insert(self, table_name: str, embedding: List[float], content: str):
+        """Insert a document with embedding."""
+        # Format embedding as JSON array
+        emb_str = "[" + ",".join(f"{x:.6f}" for x in embedding) + "]"
+        # Escape single quotes in content
+        content_escaped = content.replace("'", "''")
+        sql = f"INSERT INTO {table_name} (embedding, content) VALUES ({emb_str}, '{content_escaped}');"
+        return self.execute(sql)
+
+    def search_similar(self, table_name: str, query_embedding: List[float], k: int = 3) -> List[Tuple[str, float]]:
+        """Search for similar documents."""
+        # Format embedding as JSON array
+        emb_str = "[" + ",".join(f"{x:.6f}" for x in query_embedding) + "]"
+        sql = f"SELECT * FROM {table_name} WHERE embedding SIMILARITY {emb_str} LIMIT {k};"
+        output = self.execute(sql)
+
+        # Parse output to extract results
+        results = []
+        lines = output.strip().split('\n')
+        for line in lines:
+            if 'distance=' in line and 'content=' in line:
+                # Parse the line to extract content and distance
+                # Format: id=X, distance=Y.YYYY, values=[Vector([...]), Text("...")]
+                try:
+                    # Extract distance
+                    dist_start = line.find('distance=') + 9
+                    dist_end = line.find(',', dist_start)
+                    distance = float(line[dist_start:dist_end])
+
+                    # Extract content from Text("...")
+                    text_start = line.find('Text("') + 6
+                    text_end = line.rfind('")')
+                    content = line[text_start:text_end]
+
+                    results.append((content, distance))
+                except:
+                    pass
+
+        return results
 
 
 def main():
-    print("=== PardusDB Simple RAG (Python) ===\n")
+    print("=" * 60)
+    print("  PardusDB Simple RAG Example with Ollama")
+    print("=" * 60)
+    print()
+
+    # Check pardusdb binary
+    if not os.path.exists(PARDUSDB_BIN):
+        print(f"Error: PardusDB binary not found at {PARDUSDB_BIN}")
+        print("Build it with: cargo build --release")
+        return
+
+    print(f"PardusDB binary: {PARDUSDB_BIN}")
 
     # Check Ollama
     print("Checking Ollama...")
     try:
-        response = requests.get("http://localhost:11434/api/tags")
+        response = requests.get("http://localhost:11434/api/tags", timeout=5)
         print(f"Ollama is running!\n")
     except requests.exceptions.ConnectionError:
         print("Error: Ollama not running. Start with: ollama serve")
+        return
+    except requests.exceptions.Timeout:
+        print("Error: Ollama connection timed out")
         return
 
     # Sample documents
@@ -81,28 +160,35 @@ def main():
         "SQLite is an embedded database that stores everything in a single file.",
     ]
 
-    print("=== Ingesting Documents ===")
-    print(f"Getting embeddings from Ollama ({OLLAMA_MODEL})...\n")
+    # Get embedding dimension from first document
+    print(f"Getting embeddings from Ollama (model: {OLLAMA_MODEL})...\n")
+    sample_embedding = get_embedding("test")
+    embedding_dim = len(sample_embedding)
+    print(f"Embedding dimension: {embedding_dim}\n")
 
-    # Get embeddings for all documents
-    doc_embeddings = []
+    # Create database and table
+    print("Creating PardusDB database...")
+    db = PardusDB(DB_PATH)
+    result = db.create_table("documents", embedding_dim)
+    print(f"Created table 'documents'\n")
+
+    # Insert documents
+    print("=== Ingesting Documents ===")
     for i, doc in enumerate(documents):
-        print(f"  [{i+1}/{len(documents)}] Embedding: {doc[:50]}... ", end="", flush=True)
+        print(f"  [{i+1}/{len(documents)}] Embedding: {doc[:40]}... ", end="", flush=True)
         try:
             embedding = get_embedding(doc)
-            doc_embeddings.append((doc, embedding))
-            print(f"OK (dim={len(embedding)})")
+            db.insert("documents", embedding, doc)
+            print("OK")
         except Exception as e:
             print(f"FAILED: {e}")
             return
 
-    print(f"\n=== Database Created ===")
-    print(f"File: {DB_PATH}")
-    print(f"Documents: {len(doc_embeddings)}")
-    print(f"Embedding dimension: {len(doc_embeddings[0][1])}")
+    print(f"\nDatabase: {DB_PATH}")
+    print(f"Documents stored: {len(documents)}\n")
 
-    # Query example
-    print("\n=== RAG Query Example ===\n")
+    # Query examples
+    print("=== RAG Query Examples ===\n")
 
     queries = [
         "What is a vector database?",
@@ -118,32 +204,32 @@ def main():
             query_embedding = get_embedding(query)
             print(f"OK (dim={len(query_embedding)})")
 
-            # Calculate similarities (cosine similarity)
-            similarities = []
-            for doc, emb in doc_embeddings:
-                # Cosine similarity
-                dot = sum(a * b for a, b in zip(query_embedding, emb))
-                norm_a = sum(a * a for a in query_embedding) ** 0.5
-                norm_b = sum(b * b for b in emb) ** 0.5
-                sim = dot / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0
-                similarities.append((doc, sim))
+            # Search using PardusDB
+            results = db.search_similar("documents", query_embedding, k=3)
 
-            # Sort by similarity (descending)
-            similarities.sort(key=lambda x: x[1], reverse=True)
-
-            print("\nTop 3 similar documents:")
-            for i, (doc, score) in enumerate(similarities[:3]):
-                print(f"  [{i+1}] Score: {score:.4f}")
-                print(f"      \"{doc[:70]}...\"")
+            print("\nTop 3 similar documents (from PardusDB):")
+            for i, (doc, distance) in enumerate(results):
+                similarity = 1 - distance  # Convert distance to similarity
+                print(f"  [{i+1}] Distance: {distance:.4f} (similarity: {similarity:.4f})")
+                print(f"      \"{doc[:70]}...\"" if len(doc) > 70 else f"      \"{doc}\"")
             print()
 
         except Exception as e:
             print(f"FAILED: {e}")
+            import traceback
+            traceback.print_exc()
 
-    print("=== Summary ===")
+    # Summary
+    print("=" * 60)
+    print("  Summary")
+    print("=" * 60)
     print(f"Database file: {DB_PATH}")
-    print(f"Documents stored: {len(doc_embeddings)}")
+    print(f"Documents stored: {len(documents)}")
+    print(f"Embedding dimension: {embedding_dim}")
     print(f"To clean up: rm {DB_PATH}")
+    print()
+    print("This example used PardusDB's built-in vector similarity search")
+    print("instead of computing similarities manually in Python!")
 
 
 if __name__ == "__main__":

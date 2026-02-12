@@ -241,13 +241,29 @@ cargo run --release --bin benchmark_accuracy
 cargo run --release --features neo4j --bin benchmark_accuracy
 ```
 
-## Python Integration & RAG Example
+## Examples
 
-See `examples/python/simple_rag.py` — a complete retrieval-augmented generation demo using Ollama for embeddings and PardusDB as the vector store.
+### Rust Example
+
+A complete RAG example demonstrating PardusDB's features:
+
+```bash
+cargo run --example simple_rag --release
+```
+
+This shows:
+- Creating tables with VECTOR columns
+- Individual inserts with `insert_direct()`
+- Batch inserts with `insert_batch_direct()`
+- Similarity search with `search_similar()`
+
+### Python Example
+
+See `examples/python/simple_rag.py` — a RAG demo using Ollama for embeddings and PardusDB as the vector store.
 
 ```bash
 cd examples/python
-pip install requests ollama
+pip install requests
 python simple_rag.py
 ```
 
