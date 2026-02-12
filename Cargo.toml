@@ -19,10 +19,15 @@ async-trait = { version = "0.1", optional = true }
 neo4rs = { version = "0.8", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
 
+# HelixDB client (optional, for benchmarks)
+reqwest = { version = "0.11", optional = true, features = ["blocking", "json"] }
+serde_json = { version = "1.0", optional = true }
+
 [features]
 default = []
 gpu = ["wgpu", "bytemuck", "pollster", "async-trait"]
 neo4j = ["dep:neo4rs", "dep:tokio"]
+helix = ["dep:reqwest", "dep:serde_json"]
 
 [dev-dependencies]
 rand = "0.8"

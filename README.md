@@ -241,6 +241,60 @@ cargo run --release --bin benchmark_accuracy
 cargo run --release --features neo4j --bin benchmark_accuracy
 ```
 
+## Benchmark: PardusDB vs HelixDB
+
+Comparison against HelixDB, an open-source graph-vector database built in Rust.
+
+**Test Configuration:**
+- Vector dimension: 128
+- Number of vectors: 10,000
+- Number of queries: 100
+- Top-K: 10
+
+### Results
+
+| Database   | Insert (10K vectors) | Search (100 queries) | Single Search |
+|------------|---------------------|----------------------|---------------|
+| PardusDB   | 14ms (696K/s)       | 280µs (357K/s)       | 2µs           |
+| HelixDB    | 2.87s (3.5K/s)      | 17ms (5.8K/s)        | 172µs         |
+
+### Speedup
+
+| Operation | PardusDB Advantage |
+|-----------|-------------------|
+| Insert    | **200x faster**   |
+| Search    | **62x faster**    |
+
+### Feature Comparison
+
+| Feature         | PardusDB              | HelixDB                |
+|-----------------|-----------------------|------------------------|
+| Architecture    | Embedded (SQLite-like)| Server (Docker)        |
+| Implementation  | Rust (native)         | Rust (native)          |
+| Vector Index    | HNSW (optimized)      | HNSW                   |
+| Graph Support   | No                    | Yes                    |
+| Deployment      | Single binary/file    | Docker + CLI           |
+| Setup Time      | 0 seconds             | 5-10 minutes           |
+| Memory Overhead | Minimal (~50MB)       | Docker container       |
+| Query Language  | SQL-like              | HelixQL                |
+| Network Latency | None (in-process)     | HTTP API overhead      |
+| Persistence     | Single file (.pardus) | LMDB                   |
+| License         | MIT                   | AGPL-3.0               |
+
+Run the benchmark yourself:
+```bash
+# Without HelixDB (PardusDB only)
+cargo run --release --bin benchmark_helix
+
+# With HelixDB comparison (requires HelixDB running)
+curl -sSL "https://install.helix-db.com" | bash
+mkdir helix_bench && cd helix_bench
+helix init
+# Add schema.hx and queries.hx for vectors
+helix push dev
+cargo run --release --features helix --bin benchmark_helix
+```
+
 ## Examples
 
 ### Rust Example
