@@ -12,6 +12,9 @@ While [Pardus AI](https://pardusai.org/) gives non-technical users a powerful no
 - **Single-file storage** — Everything lives in one `.pardus` file, just like SQLite
 - **Multiple tables** — Store different vector dimensions and metadata in the same database
 - **Familiar SQL-like syntax** — CREATE, INSERT, SELECT, UPDATE, DELETE feel natural
+- **UNIQUE constraints** — O(1) duplicate detection using HashSet
+- **GROUP BY with aggregates** — O(n) hash aggregation with COUNT, SUM, AVG, MIN, MAX
+- **JOINs** — O(n+m) hash join algorithm for INNER, LEFT, RIGHT joins
 - **Fast vector similarity search** — Graph-based approximate nearest neighbor search
 - **Thread-safe** — Safe concurrent reads in multi-threaded applications
 - **Full transactions** — BEGIN/COMMIT/ROLLBACK for atomic operations
@@ -116,6 +119,59 @@ SELECT * FROM documents WHERE category = 'tutorial' LIMIT 10;
 UPDATE documents SET score = 0.99 WHERE id = 1;
 
 DELETE FROM documents WHERE id = 1;
+```
+
+### UNIQUE Constraint
+
+Ensure column values are unique with O(1) duplicate detection:
+
+```sql
+CREATE TABLE users (
+    embedding VECTOR(128),
+    id INTEGER PRIMARY KEY,
+    email TEXT UNIQUE
+);
+
+-- This will fail - duplicate email
+INSERT INTO users (embedding, id, email) VALUES ([0.1, ...], 1, 'test@example.com');
+INSERT INTO users (embedding, id, email) VALUES ([0.2, ...], 2, 'test@example.com');
+-- Error: Duplicate value for UNIQUE column 'email'
+```
+
+### GROUP BY with Aggregates
+
+Group and aggregate data with O(n) hash aggregation:
+
+```sql
+-- Aggregate functions: COUNT, SUM, AVG, MIN, MAX
+SELECT category, COUNT(*), AVG(score), SUM(amount)
+FROM sales
+GROUP BY category;
+
+-- With HAVING clause for filtered groups
+SELECT category, SUM(amount) as total
+FROM sales
+GROUP BY category
+HAVING SUM(amount) > 1000;
+```
+
+### JOINs
+
+Join tables with O(n+m) hash join algorithm:
+
+```sql
+-- INNER JOIN
+SELECT * FROM orders
+INNER JOIN users ON orders.user_id = users.id;
+
+-- LEFT JOIN (include all left rows)
+SELECT users.email, orders.product
+FROM users
+LEFT JOIN orders ON users.id = orders.user_id;
+
+-- RIGHT JOIN (include all right rows)
+SELECT * FROM users
+RIGHT JOIN orders ON users.id = orders.user_id;
 ```
 
 ### Vector Similarity Search
