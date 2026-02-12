@@ -1,0 +1,42 @@
+{
+  "name": "@pardusai/pardusdb-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for PardusDB - A fast, SQLite-like embedded vector database",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "pardusdb-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts",
+    "prepare": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "vector-database",
+    "ai",
+    "rag",
+    "embeddings"
+  ],
+  "author": "Pardus AI <hello@pardusai.org>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pardus-ai/pardusdb",
+    "directory": "mcp"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "ts-node": "^10.9.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
