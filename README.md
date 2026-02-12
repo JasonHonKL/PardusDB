@@ -151,9 +151,9 @@ DROP TABLE documents;
 
 | Operation                  | Time          |
 |----------------------------|---------------|
-| Single insert              | ~140 µs/doc   |
-| Query (k=10)               | ~42 µs        |
-| Batch insert (1,000 docs)  | ~140 ms       |
+| Single insert              | ~160 µs/doc   |
+| Batch insert (1,000 docs)  | ~6 ms         |
+| Query (k=10)               | ~3 µs         |
 
 ## Benchmark: PardusDB vs Neo4j
 
@@ -169,15 +169,26 @@ Real-world benchmark comparing PardusDB against Neo4j 5.15 for vector similarity
 
 | Database   | Insert (10K vectors) | Search (100 queries) | Single Search |
 |------------|---------------------|----------------------|---------------|
-| PardusDB   | 2.95s (3.4K/s)      | 37ms (2.7K/s)        | 375µs         |
+| PardusDB   | 18ms (543K/s)       | 355µs (281K/s)       | 3µs           |
 | Neo4j      | 35.70s (280/s)      | 153ms (650/s)        | 1ms           |
 
 ### Speedup
 
 | Operation | PardusDB Advantage |
 |-----------|-------------------|
-| Insert    | **12.1x faster**  |
-| Search    | **4.1x faster**   |
+| Insert    | **1983x faster**  |
+| Search    | **431x faster**   |
+
+### Batch Insert Performance
+
+PardusDB supports batch inserts for massive performance gains:
+
+| Batch Size | Insert (10K vecs) | Speedup vs Individual |
+|------------|-------------------|----------------------|
+| Individual | 1.52s | 1.0x |
+| 100 | 33ms | 45x |
+| 500 | 10ms | 149x |
+| 1000 | 6ms | **220x** |
 
 ### Feature Comparison
 

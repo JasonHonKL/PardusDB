@@ -642,6 +642,52 @@ impl<'a> Connection<'a> {
         table.insert_row(row_values)
     }
 
+    /// Batch insert without SQL parsing - significantly faster than individual inserts.
+    pub fn insert_batch_direct(
+        &mut self,
+        table_name: &str,
+        vectors: Vec<Vec<f32>>,
+        metadata: Vec<Vec<(&str, Value)>>,
+    ) -> Result<Vec<u64>> {
+        if vectors.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut guard = self.db.inner.write().unwrap();
+
+        let table = guard.tables.get_mut(table_name)
+            .ok_or_else(|| MarsError::InvalidFormat(format!("Table '{}' does not exist", table_name)))?;
+
+        let batch_size = vectors.len();
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(batch_size);
+
+        for (i, vector) in vectors.into_iter().enumerate() {
+            let mut row_values: Vec<Value> = table.schema.columns.iter()
+                .map(|_| Value::Null)
+                .collect();
+
+            // Set vector column
+            for (j, col) in table.schema.columns.iter().enumerate() {
+                if matches!(col.data_type, ColumnType::Vector(_)) {
+                    row_values[j] = Value::Vector(vector.clone());
+                }
+            }
+
+            // Set metadata if provided
+            if let Some(meta) = metadata.get(i) {
+                for (col_name, value) in meta {
+                    if let Some(idx) = table.schema.columns.iter().position(|c| &c.name == *col_name) {
+                        row_values[idx] = value.clone();
+                    }
+                }
+            }
+
+            rows.push(row_values);
+        }
+
+        table.insert_batch(rows)
+    }
+
     /// Direct similarity search without SQL parsing.
     pub fn search_similar(
         &self,

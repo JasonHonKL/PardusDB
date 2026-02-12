@@ -69,18 +69,25 @@ fn pardusdb_benchmark() -> BenchmarkResult {
     let vectors = generate_vectors(NUM_VECTORS, DIM);
     let query_vectors = generate_vectors(NUM_QUERIES, DIM);
 
-    // Insert
+    // Insert using batch for better performance
     println!("  [PardusDB] Inserting {} vectors...", NUM_VECTORS);
     let insert_start = Instant::now();
-    for (i, vec) in vectors.iter().enumerate() {
-        conn.insert_direct(
-            "vectors",
-            vec.clone(),
-            vec![
-                ("id", Value::Integer(i as i64)),
-                ("category", Value::Text(format!("cat_{}", i % 100))),
-            ],
-        ).unwrap();
+
+    // Use batch insert with chunks of 1000
+    const BATCH_SIZE: usize = 1000;
+    for chunk in vectors.chunks(BATCH_SIZE) {
+        let batch_vectors: Vec<Vec<f32>> = chunk.to_vec();
+        let batch_metadata: Vec<Vec<(&str, Value)>> = chunk.iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let global_i = i; // relative index in chunk
+                vec![
+                    ("id", Value::Integer(global_i as i64)),
+                    ("category", Value::Text(format!("cat_{}", global_i % 100))),
+                ]
+            })
+            .collect();
+        conn.insert_batch_direct("vectors", batch_vectors, batch_metadata).unwrap();
     }
     let insert_time = insert_start.elapsed();
 

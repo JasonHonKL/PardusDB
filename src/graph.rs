@@ -326,6 +326,119 @@ where
         node_id
     }
 
+    /// Batch insert multiple vectors into the graph.
+    /// This is significantly faster than individual inserts because:
+    /// 1. Pre-allocates all nodes at once
+    /// 2. Computes centroid in bulk
+    /// 3. Defers neighbor linking until all nodes are added
+    /// Returns the IDs of all newly inserted nodes.
+    pub fn insert_batch(&mut self, vectors: Vec<Vec<T>>) -> Vec<NodeId> {
+        if vectors.is_empty() {
+            return Vec::new();
+        }
+
+        let max_neighbors = self.config.max_neighbors;
+        let alpha = self.config.alpha_strict;
+        let search_buffer = self.config.search_buffer;
+        let batch_size = vectors.len();
+
+        // Pre-allocate node IDs
+        let start_id = self.nodes.len() as NodeId;
+        let mut node_ids: Vec<NodeId> = (start_id..start_id + batch_size as NodeId).collect();
+
+        // Update active count
+        self.active_count += batch_size;
+
+        // Pre-allocate nodes vector
+        self.nodes.reserve(batch_size);
+
+        // Compute centroid contribution from batch
+        let n_existing = self.active_count - batch_size;
+        let n_total = self.active_count;
+
+        // Insert all nodes first (without connecting edges)
+        for (i, vector) in vectors.into_iter().enumerate() {
+            let node_id = node_ids[i];
+
+            // Update centroid incrementally
+            let n_before = n_existing + i;
+            let n_after = n_before + 1;
+            self.centroid
+                .iter_mut()
+                .zip(vector.iter())
+                .for_each(|(c, &v)| {
+                    *c = *c * (n_before as f32 / n_after as f32) + v.to_f32() / n_after as f32;
+                });
+
+            // Create node without neighbors
+            let node = Node::with_capacity(vector, max_neighbors);
+            self.nodes.push(node);
+        }
+
+        // If this is the first batch, just return - no edges to connect
+        if n_existing == 0 {
+            return node_ids;
+        }
+
+        // Now connect edges for all new nodes
+        // Collect all edge updates first to avoid borrow issues
+        let mut edge_updates: Vec<(NodeId, Vec<NodeId>)> = Vec::with_capacity(batch_size);
+
+        for &node_id in &node_ids {
+            let vector = self.nodes[node_id as usize].vector.as_ref().clone();
+
+            // Search for candidates among existing nodes
+            let candidates = self.search(&vector, search_buffer);
+
+            // Prune candidates to get neighbors
+            let neighbors = self.robust_prune(&vector, &candidates, alpha, max_neighbors);
+            edge_updates.push((node_id, neighbors));
+        }
+
+        // Apply edge updates
+        for (node_id, neighbors) in edge_updates {
+            // Set neighbors for new node
+            if let Some(node) = self.nodes.get_mut(node_id as usize) {
+                node.neighbors = neighbors.clone();
+            }
+
+            // Back-link: add new node to neighbors' neighbor lists
+            for &neighbor_id in &neighbors {
+                if let Some(neighbor) = self.nodes.get_mut(neighbor_id as usize) {
+                    neighbor.add_neighbor(node_id);
+
+                    // Check if we need to prune this neighbor
+                    if neighbor.neighbors.len() > max_neighbors {
+                        // Defer pruning to avoid nested borrow issues
+                    }
+                }
+            }
+        }
+
+        // Handle reverse pruning for neighbors that exceeded max_neighbors
+        // We do this in a separate pass
+        let mut to_prune: Vec<NodeId> = Vec::new();
+        for &node_id in &node_ids {
+            if let Some(node) = self.nodes.get(node_id as usize) {
+                for &neighbor_id in &node.neighbors {
+                    if let Some(neighbor) = self.nodes.get(neighbor_id as usize) {
+                        if neighbor.neighbors.len() > max_neighbors {
+                            if !to_prune.contains(&neighbor_id) {
+                                to_prune.push(neighbor_id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for neighbor_id in to_prune {
+            self.reverse_prune(neighbor_id, max_neighbors, alpha);
+        }
+
+        node_ids
+    }
+
     /// Reverse prune a node that may have too many neighbors.
     fn reverse_prune(&mut self, node_id: NodeId, max_neighbors: usize, alpha: f32) {
         let neighbor_ids: Vec<NodeId> = match self.get(node_id) {

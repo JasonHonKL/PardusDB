@@ -75,6 +75,49 @@ impl Table {
         Ok(id)
     }
 
+    /// Batch insert multiple rows for better performance.
+    /// This is significantly faster than individual inserts.
+    pub fn insert_batch(&mut self, rows: Vec<Vec<Value>>) -> Result<Vec<u64>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let batch_size = rows.len();
+        let start_id = self.next_id;
+        let ids: Vec<u64> = (start_id..start_id + batch_size as u64).collect();
+        self.next_id += batch_size as u64;
+
+        // Prepare vectors and rows
+        let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(batch_size);
+        let mut prepared_rows: Vec<(u64, Vec<Value>)> = Vec::with_capacity(batch_size);
+
+        for (i, mut row_values) in rows.into_iter().enumerate() {
+            let id = ids[i];
+
+            // If there's an 'id' column, set it to the auto-generated ID
+            if let Some(idx) = self.column_index("id") {
+                row_values[idx] = Value::Integer(id as i64);
+            }
+
+            // Extract vector
+            let vector = self.extract_vector(&row_values)?;
+            vectors.push(vector);
+
+            prepared_rows.push((id, row_values));
+        }
+
+        // Batch insert into graph
+        let _graph_ids = self.graph.insert_batch(vectors);
+
+        // Insert all rows
+        for (id, row_values) in prepared_rows {
+            let row = Row::new(id, row_values);
+            self.rows.insert(id, row);
+        }
+
+        Ok(ids)
+    }
+
     /// Select rows matching conditions
     pub fn select(
         &self,
