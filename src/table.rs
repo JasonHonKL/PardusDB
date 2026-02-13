@@ -286,7 +286,7 @@ impl Table {
         Ok(row_values)
     }
 
-    /// Extract vector from row values
+    /// Extract vector from row values, validating dimension matches schema
     fn extract_vector(&self, values: &[Value]) -> Result<Vec<f32>> {
         let vec_col = self.schema.vector_column.as_ref()
             .ok_or_else(|| MarsError::InvalidConfig("No vector column defined".into()))?;
@@ -295,7 +295,16 @@ impl Table {
             .ok_or_else(|| MarsError::InvalidConfig("Vector column not found".into()))?;
 
         match &values[idx] {
-            Value::Vector(v) => Ok(v.clone()),
+            Value::Vector(v) => {
+                let expected_dim = self.graph.dimension();
+                if v.len() != expected_dim {
+                    return Err(MarsError::InvalidFormat(format!(
+                        "Vector dimension mismatch: expected {}, got {}",
+                        expected_dim, v.len()
+                    )));
+                }
+                Ok(v.clone())
+            }
             _ => Err(MarsError::InvalidFormat("Vector column must contain a vector".into())),
         }
     }
